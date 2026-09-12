@@ -1,0 +1,12 @@
+{
+  "name": "way-creating-chess-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Way Creating Chess（造路四子棋）的纯静态网页版，可直接部署到 GitHub Pages。",
+  "scripts": {
+    "serve": "node tools/serve.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "build:boards": "node tools/generate-boards-data.mjs"
+  }
+}

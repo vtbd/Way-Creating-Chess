@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Way Creating Chess · 造路四子棋（网页版）</title>
+    <meta
+      name="description"
+      content="Way Creating Chess 网页版：自定义初始棋盘、双人/人机对战、内置随机 AI 与 Alpha-Beta 思考型 AI，可直接部署到 GitHub Pages。"
+    />
+    <link rel="icon" type="image/svg+xml" href="assets/icon.svg" />
+    <link rel="apple-touch-icon" href="assets/icon.svg" />
+    <link rel="stylesheet" href="css/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <img class="brand-icon" src="assets/icon.svg" alt="" width="44" height="44" />
+          <div class="brand-text">
+            <h1>Way Creating Chess</h1>
+            <p>造路四子棋 · 网页版</p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <button id="btn-open-help" class="ghost-button" type="button">规则说明 (H)</button>
+          <button id="btn-open-setup" class="primary-button" type="button">新棋盘 / 自定义 (N)</button>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="board-panel">
+          <div class="board-frame">
+            <div id="board" class="board" aria-label="棋盘"></div>
+          </div>
+          <p id="board-caption" class="board-caption"></p>
+          <p id="notice" class="notice" aria-live="polite"></p>
+        </section>
+
+        <aside class="sidebar">
+          <section class="card">
+            <h2>对局状态</h2>
+            <div id="turn-chip" class="turn-chip"></div>
+            <p id="status-line" class="status-line"></p>
+            <dl class="stats">
+              <div><dt>已走</dt><dd id="stat-moves">0</dd></div>
+              <div><dt>可走</dt><dd id="stat-open">0</dd></div>
+              <div><dt>棋盘</dt><dd id="stat-board">—</dd></div>
+            </dl>
+            <p id="thinking" class="thinking hidden"></p>
+          </section>
+
+          <section class="card">
+            <h2>双方身份</h2>
+            <div id="sides" class="sides"></div>
+            <button id="swap-btn" class="action-button wide" type="button">⇄ 交换双方身份</button>
+            <p class="card-hint">快速预设</p>
+            <div id="presets" class="presets"></div>
+          </section>
+
+          <section class="card">
+            <h2>操作</h2>
+            <div id="actions" class="actions"></div>
+            <p class="card-hint">
+              U 撤销 · R 重开 · N 新棋盘 · E 编辑 · T AI 参数 · S 棋谱 · P 存棋盘 · H 规则 · 1/2 切换 A、B 方控制
+            </p>
+          </section>
+
+          <section class="card">
+            <h2>棋谱</h2>
+            <ol id="history" class="history"></ol>
+            <p class="card-hint">点击任意一步可在棋盘上高亮该手与它造出的道路。</p>
+          </section>
+        </aside>
+      </main>
+
+      <footer class="page-footer">
+        <p>
+          规则与桌面版 <code>game_engine.py</code> 一致：在“可走”格落子后自动造路，先连成四子者获胜。
+          棋盘可随机生成、手动编辑，也能把当前局面存成新的初始棋盘。
+        </p>
+      </footer>
+    </div>
+
+    <div id="modal-root" class="modal-root hidden">
+      <div id="modal" class="modal" role="dialog" aria-modal="true"></div>
+    </div>
+
+    <div id="boot-warning" class="boot-warning hidden">
+      <h2>需要通过本地服务器或 GitHub Pages 打开</h2>
+      <p>
+        这个页面使用了 ES 模块与 Web Worker，直接双击 <code>index.html</code>（<code>file://</code>
+        ）会被浏览器拦截。请在项目目录执行任意一条命令，再访问提示的地址：
+      </p>
+      <pre>node tools/serve.mjs</pre>
+      <pre>npx serve .        （或：py -m http.server 8000）</pre>
+      <p>然后打开 <code>http://localhost:8000/</code>。部署到 GitHub Pages 后可直接访问网址，无需任何额外配置。</p>
+    </div>
+
+    <script>
+      (function () {
+        var warning = document.getElementById('boot-warning');
+        function reveal() {
+          warning.classList.remove('hidden');
+        }
+        if (window.location.protocol === 'file:') reveal();
+        window.setTimeout(function () {
+          if (!window.__wayChessBooted) reveal();
+        }, 1500);
+      })();
+    </script>
+    <script type="module" src="js/app.js"></script>
+  </body>
+</html>
