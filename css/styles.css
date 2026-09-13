@@ -407,6 +407,17 @@ button {
   font: inherit;
   color: inherit;
   cursor: pointer;
+  /* Buttons without an explicit class still need the app's look — the browser
+     default is a light button that would make the light text unreadable. */
+  background: var(--button);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 9px;
+  padding: 8px 12px;
+  transition: background 120ms ease, transform 80ms ease;
+}
+
+button:not([class]):hover {
+  background: var(--button-hover);
 }
 
 .action-button,

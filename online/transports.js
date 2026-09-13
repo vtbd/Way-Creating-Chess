@@ -132,5 +132,16 @@ export function createSupabaseStore({ url, key, room, fetchImpl = globalThis.fet
       if (bad) return failure(bad, '清空房间');
       return this.updateRoom({ game: 1 });
     },
+
+    /** Host-only: delete the room itself, freeing the code for reuse. */
+    async closeRoom() {
+      const responses = await Promise.all([
+        fetchImpl(`${moves}?${roomFilter}`, { method: 'DELETE', headers }),
+        fetchImpl(`${events}?${roomFilter}`, { method: 'DELETE', headers }),
+        fetchImpl(`${rooms}?code=eq.${encodeURIComponent(code)}`, { method: 'DELETE', headers }),
+      ]);
+      const bad = responses.find((response) => !response.ok);
+      return bad ? failure(bad, '关闭房间') : { ok: true };
+    },
   };
 }

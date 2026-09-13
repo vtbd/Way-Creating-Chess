@@ -166,21 +166,43 @@ export function latestEvent(list) {
 /**
  * The undo request waiting for an answer, if any.
  *
- * A request is stale as soon as somebody played instead of answering, which is
- * detectable without extra state: the requester asked while exactly one move
- * was on the board after the target.
+ * The requester always asks while it is their own turn, so the request keeps
+ * exactly one or two moves (their own move, or the opponent's reply plus their
+ * own move). Anything else means somebody played instead of answering, and the
+ * request is stale.
  */
 export function pendingUndo(list, moveCount) {
   const last = latestEvent(list);
   if (!last || last.kind !== EVENT.UNDO_REQUEST) return null;
   if (!Number.isInteger(last.target) || last.target < 0) return null;
-  if (Number(moveCount) !== last.target + 1) return null;
-  return { id: last.id, side: last.side, target: last.target };
+  const removeCount = Number(moveCount) - last.target;
+  if (removeCount !== 1 && removeCount !== 2) return null;
+  return { id: last.id, side: last.side, target: last.target, removeCount };
 }
 
-/** Index the requester wants to keep: everything except the last move. */
-export function undoTargetFor(moveCount) {
-  return Math.max(0, Number(moveCount) - 1);
+/**
+ * What a fair undo means for the side asking.
+ *
+ * 悔棋 always returns the turn to the requester:
+ *   - requester just moved (opponent to move) -> take back that single move;
+ *   - opponent already answered (requester to move) -> take back both plies,
+ *     so the requester is back at the position where they blundered.
+ *
+ * @returns {{target: number, removeCount: number, moveCount: number}|null}
+ *   `null` when the requester has no move of their own yet.
+ */
+export function undoPlan(moves, requester) {
+  const list = sortMoves(moves);
+  if (!list.length) return null;
+  const own = list.filter((move) => move.side === Number(requester)).length;
+  if (own === 0) return null;
+  const last = list[list.length - 1];
+  const removeCount = last.side === Number(requester) ? 1 : 2;
+  return {
+    target: Math.max(0, list.length - removeCount),
+    removeCount,
+    moveCount: list.length,
+  };
 }
 
 /* ---------------------------------------------------------------- display */

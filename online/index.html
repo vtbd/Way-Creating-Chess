@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Way Creating Chess · 联机对战</title>
+    <title>造道棋 · 联机版（Way Creating Chess）</title>
     <meta
       name="description"
       content="Way Creating Chess 网页联机版：房主创建房间并决定先后手与初始棋盘，邀请链接一键加入，支持请求撤销与再来一局。"
@@ -18,13 +18,12 @@
         <div class="brand">
           <img class="brand-icon" src="../assets/icon.svg" alt="" width="44" height="44" />
           <div class="brand-text">
-            <h1>联机对战</h1>
-            <p>Way Creating Chess · 房间号对战</p>
+            <h1>造道棋</h1>
+            <p>Way Creating Chess · 联机版</p>
           </div>
         </div>
         <div class="topbar-actions">
-          <a class="ghost-button link-button" href="../index.html">返回单机版</a>
-          <a class="ghost-button link-button" href="README.md">联机说明</a>
+          <button id="open-rules" class="ghost-button" type="button">规则说明 (H)</button>
         </div>
       </header>
 
@@ -58,6 +57,10 @@
           两边各自重放得到棋局，刷新与断线重连只需重新拉一次数据。
         </p>
       </footer>
+    </div>
+
+    <div id="modal-root" class="modal-root hidden">
+      <div id="modal" class="modal" role="dialog" aria-modal="true"></div>
     </div>
 
     <div id="boot-warning" class="boot-warning hidden">

@@ -29,6 +29,7 @@ import { clear, downloadText, h, qs, timestamp } from './dom.js';
 import { EditorModel, clampDimension } from './editor.js';
 import { Cell, GameState, playerLabel } from './engine.js';
 import { drawMiniBoard } from './preview.js';
+import { GAME_RULES, SOLO_CONTROLS, renderRuleSections } from './rules.js';
 
 const AI_MOVE_DELAY_MS = 320;
 const SETTINGS_KEY = 'wcc.ai-settings.v1';
@@ -1028,26 +1029,12 @@ function renderAiPanel() {
 /* --- rules --------------------------------------------------------------- */
 
 function renderHelpPanel() {
+  const body = h('div', { class: 'modal-body help-body' });
+  renderRuleSections(body, [...GAME_RULES, ...SOLO_CONTROLS]);
+  body.append(h('footer', { class: 'modal-footer' }, h('button', { type: 'button', onclick: closePanel }, '知道了')));
   els.modal.append(
     modalHeader('游戏规则', '与桌面版 game_engine.py 完全一致的判定逻辑'),
-    h('div', { class: 'modal-body help-body' },
-      h('ul', { class: 'rule-list' },
-        h('li', { text: '棋盘由三种格子组成：深色“封闭”格不能落子，浅色“可走”格可以落子，圆形棋子占据的格子不能再落子。' }),
-        h('li', { text: 'A 方（蓝）先手，双方轮流在任意“可走”格落子。' }),
-        h('li', { text: '每次落子后自动“造路”：以新棋子为起点，向上、下、左、右四个方向扫描；若在遇到对手棋子之前先遇到己方棋子，两者之间的所有封闭格都变成“可走”格。' }),
-        h('li', { text: '对手棋子会阻断该方向；斜向不会造路；每个方向只使用遇到的第一枚己方棋子。' }),
-        h('li', { text: '任意一方在水平、垂直或两条对角线上连成四子（含五连及以上）即获胜。' }),
-        h('li', { text: '当棋盘上不再有“可走”格且无人四连时为和棋。造路机制意味着双方既要防守对手的四连，也要为自己打开新的落点。' }),
-      ),
-      h('h3', { text: '操作' }),
-      h('ul', { class: 'rule-list' },
-        h('li', { text: '左键点击浅色格落子；侧栏可切换 A/B 方由“玩家 / 随机 AI / 思考型 AI”控制。' }),
-        h('li', { text: '“交换双方”按钮可互换 A、B 两方的身份；也可以一键套用“双人对战 / 我执 A / 我执 B / AI 自对弈”预设。' }),
-        h('li', { text: '快捷键：U 撤销 · R 重开 · N 新棋盘 · E 编辑 · T AI 参数 · S 棋谱 · P 保存当前棋盘 · H 规则 · 1/2 切换 A/B 方控制。' }),
-        h('li', { text: '棋盘编辑器：1-4 切换工具（封闭 / 可走 / A 棋子 / B 棋子），左键涂抹、右键擦除，可调整尺寸到 4-40。' }),
-      ),
-      h('footer', { class: 'modal-footer' }, h('button', { type: 'button', onclick: closePanel }, '知道了')),
-    ),
+    body,
   );
 }
 

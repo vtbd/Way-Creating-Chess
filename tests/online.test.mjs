@@ -28,7 +28,7 @@ import {
   rebuild,
   resolveHostSide,
   sideForRole,
-  undoTargetFor,
+  undoPlan,
 } from '../online/online-core.js';
 import { createSupabaseStore } from '../online/transports.js';
 import { installDom } from './dom-shim.mjs';
@@ -76,6 +76,16 @@ test('the load-failure banner reports real errors and clears on boot', () => {
   assert.match(bannerHtml, /unhandledrejection/);
   assert.match(pageSource, /__wayChessBanner\.ready\(\)/, 'booting must hide the banner again');
   assert.match(pageSource, /启动失败/, 'a startup exception must be surfaced');
+});
+
+test('the online page hides the solo/readme links and ships the rules panel', () => {
+  assert.match(bannerHtml, /id="open-rules"/, 'the rules button is available to players');
+  assert.match(bannerHtml, /id="modal-root"/);
+  assert.equal(/返回单机版/.test(bannerHtml), false, 'the solo-build link is hidden for now');
+  assert.equal(/联机说明/.test(bannerHtml), false, 'the README link is hidden for now');
+  // Both pages use the same Chinese name with the build as the subtitle.
+  assert.match(bannerHtml, /<h1>造道棋<\/h1>/);
+  assert.match(bannerHtml, /Way Creating Chess · 联机版/);
 });
 
 test('a move list replays into the same position as the solo engine', () => {
@@ -154,16 +164,37 @@ test('host rights require the token, and the board survives the round trip', () 
   assert.deepEqual(boardFromRoom(room).content, [[1, 0], [0, 1]]);
 });
 
+test('悔棋 always hands the turn back to the side that asked', () => {
+  const a = (index, x) => ({ move_index: index, side: Cell.A, x, y: 0 });
+  const b = (index, x) => ({ move_index: index, side: Cell.B, x, y: 1 });
+
+  assert.equal(undoPlan([], Cell.A), null, 'nothing played yet');
+  assert.equal(undoPlan([a(0, 0)], Cell.B), null, 'B has no move of its own to take back');
+
+  // A just moved and B is to move: A takes back that single stone.
+  assert.deepEqual(undoPlan([a(0, 0)], Cell.A), { target: 0, removeCount: 1, moveCount: 1 });
+
+  // The reported case: A moved, B answered, A asks -> both plies are undone.
+  assert.deepEqual(undoPlan([a(0, 0), b(1, 5)], Cell.A), { target: 0, removeCount: 2, moveCount: 2 });
+
+  // A moved, B answered, A answered back, B asks: A's latest stone is removed
+  // together with B's own, so B is back in front of the position they faced.
+  assert.deepEqual(undoPlan([a(0, 0), b(1, 5), a(2, 3)], Cell.B), { target: 1, removeCount: 2, moveCount: 3 });
+
+  // Same rule deeper into the game: A asks after B's answer to A's last move.
+  assert.deepEqual(
+    undoPlan([a(0, 0), b(1, 5), a(2, 3), b(3, 7)], Cell.A),
+    { target: 2, removeCount: 2, moveCount: 4 },
+  );
+});
+
 test('undo requests expire when somebody plays instead of answering', () => {
-  const stored = { move_index: 0, side: Cell.A, x: 0, y: 0 };
   const request = { id: 7, kind: EVENT.UNDO_REQUEST, side: Cell.A, target: 0 };
   assert.equal(pendingUndo([], 1), null);
-  assert.deepEqual(pendingUndo([request], 1), { id: 7, side: Cell.A, target: 0 });
-  assert.equal(pendingUndo([request], 2), null, 'a follow-up move makes the request stale');
+  assert.deepEqual(pendingUndo([request], 1), { id: 7, side: Cell.A, target: 0, removeCount: 1 });
+  assert.deepEqual(pendingUndo([request], 2), { id: 7, side: Cell.A, target: 0, removeCount: 2 });
+  assert.equal(pendingUndo([request], 3), null, 'a follow-up move makes the request stale');
   assert.equal(pendingUndo([request, { id: 8, kind: EVENT.UNDO_DONE, side: Cell.B, target: 0 }], 1), null);
-  assert.equal(undoTargetFor(3), 2);
-  assert.equal(undoTargetFor(0), 0);
-  assert.equal(stored.side, Cell.A);
 });
 
 test('the store speaks the documented REST dialect', async () => {
@@ -242,19 +273,65 @@ test('a move by the other player is picked up on sync', async () => {
   assert.equal(el('history').querySelectorAll('.history-item').length, 2);
 });
 
+test('the rules button opens the shared rule panel', async () => {
+  assert.equal(el('modal').childNodes.length, 0, 'no panel before opening');
+  el('open-rules').fire('click');
+  assert.ok(el('modal').childNodes.length > 0, 'the panel is rendered');
+  const text = el('modal').textContent;
+  assert.match(text, /造路/);
+  assert.match(text, /A 方（蓝）先手/);
+  assert.match(text, /悔棋需要对手同意/);
+
+  dom.document.fire('keydown', { key: 'Escape' });
+  assert.equal(el('modal').childNodes.length, 0, 'Escape closes the panel');
+});
+
+test('asking for 悔棋 on your own turn takes back both plies', async () => {
+  // A moved, B answered, and now A regrets it: the request must rewind to the
+  // position before A's own move, not just to before B's answer.
+  assert.match(el('undo-hint').textContent, /撤回双方各一手/);
+  el('undo-request').fire('click');
+  await settle();
+
+  const requests = fake.eventsOf('HOST1').filter((event) => event.kind === EVENT.UNDO_REQUEST);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].side, Cell.A);
+  assert.equal(requests[0].target, 0, 'both plies are marked for removal');
+  assert.match(el('undo-status').textContent, /等待对手回应/);
+
+  // The opponent approves: the tail is deleted and an undo_done event lands.
+  fake.db.moves = fake.db.moves.filter((row) => row.room !== 'HOST1');
+  fake.injectEvent({ room: 'HOST1', kind: EVENT.UNDO_DONE, side: Cell.B, target: 0 });
+  el('sync').fire('click');
+  await settle();
+
+  assert.equal(fake.movesOf('HOST1').length, 0);
+  assert.equal(el('stat-moves').textContent, '0');
+  assert.match(el('status-line').textContent, /轮到你落子/);
+  assert.match(el('notice').textContent, /悔棋请求已被同意/);
+});
+
 test('the host can approve an undo request from the opponent', async () => {
+  // Rebuild a small position: A plays, then B answers and asks to take back
+  // the stone they just played (a one-ply undo).
+  cellAt(0, 0).fire('pointerdown', { button: 0 });
+  await settle();
+  fake.injectMove({ room: 'HOST1', moveIndex: 1, side: Cell.B, x: 5, y: 0 });
+  el('sync').fire('click');
+  await settle();
+
   fake.injectEvent({ room: 'HOST1', kind: EVENT.UNDO_REQUEST, side: Cell.B, target: 1 });
   el('sync').fire('click');
   await settle();
 
   assert.equal(el('undo-prompt').classList.contains('hidden'), false, 'the prompt is shown to the other side');
-  assert.match(el('undo-text').textContent, /请求撤销/);
+  assert.match(el('undo-text').textContent, /请求悔棋/);
   el('undo-accept').fire('click');
   await settle();
 
   assert.equal(fake.movesOf('HOST1').length, 1, 'the last move is removed');
   assert.equal(el('stat-moves').textContent, '1');
-  assert.match(el('notice').textContent, /同意撤销|已被同意/);
+  assert.match(el('notice').textContent, /同意悔棋|已被同意/);
 });
 
 test('the invited side joins from the link, gets the other side and no host controls', async () => {
@@ -352,4 +429,21 @@ test('a custom board, a finished game and a rematch that swaps sides', async () 
   assert.match(el('role-line').textContent, /后手/, 'the host now plays second');
   assert.equal(el('result-banner').classList.contains('hidden'), true);
   assert.ok(cellAt(0, 0).classList.contains('is-legal') === false, 'it is A\'s turn, not the host\'s');
+
+  // The host can close the room, which frees the code again.
+  assert.ok(el('close-room'), 'the host owns the close-room control');
+  el('close-room').fire('click');
+  await settle();
+  assert.equal(fake.room('JSON1'), null, 'the room row is deleted');
+  assert.equal(fake.movesOf('JSON1').length, 0);
+  assert.match(el('sidebar').textContent, /创建房间/, 'the host is back on the setup screen');
+  assert.match(el('notice').textContent, /已关闭/);
+});
+
+test('a room that no longer exists is reported instead of joining', async () => {
+  const search = `?room=GONE&url=${encodeURIComponent(SUPABASE_URL)}&key=${SUPABASE_KEY}`;
+  await startPage({ tag: 'missing', search });
+  await settle();
+  assert.match(el('notice').textContent, /不存在/);
+  assert.match(el('sidebar').textContent, /创建房间/);
 });

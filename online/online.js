@@ -16,6 +16,7 @@ import { generateRandomBoard, normalizeBoardDefinition } from '../js/boards.js';
 import { clear, h, qs } from '../js/dom.js';
 import { Cell } from '../js/engine.js';
 import { drawMiniBoard } from '../js/preview.js';
+import { GAME_RULES, ONLINE_CONTROLS, renderRuleSections } from '../js/rules.js';
 import {
   EVENT,
   SIDE_CHOICES,
@@ -34,7 +35,7 @@ import {
   sideForRole,
   sideLabel,
   sideName,
-  undoTargetFor,
+  undoPlan,
 } from './online-core.js';
 import { createSupabaseStore } from './transports.js';
 
@@ -406,7 +407,8 @@ function renderRoom() {
     ),
   );
 
-  const undoRequest = h('button', { id: 'undo-request', type: 'button' }, '请求撤销上一手');
+  const undoRequest = h('button', { id: 'undo-request', class: 'action-button wide', type: 'button' }, '悔棋');
+  const undoHint = h('p', { id: 'undo-hint', class: 'hint' });
   const undoText = h('p', { id: 'undo-text' });
   const undoPrompt = h(
     'div',
@@ -425,18 +427,24 @@ function renderRoom() {
     { class: 'card' },
     h('h2', { text: '对局操作' }),
     undoRequest,
+    undoHint,
     undoPrompt,
     undoStatus,
   );
 
   // Host-only controls are not even created for guests.
   let clearRoom = null;
+  let closeRoom = null;
   if (app.host) {
-    clearRoom = h('button', { id: 'clear-room', class: 'danger-button', type: 'button' }, '清空房间（测试用）');
+    clearRoom = h('button', { id: 'clear-room', class: 'danger-button', type: 'button' }, '清空房间');
+    closeRoom = h('button', { id: 'close-room', class: 'danger-button', type: 'button' }, '关闭房间');
     actionsCard.append(
       h('hr', { class: 'divider' }),
-      h('p', { class: 'hint', text: '房主专属：清空本房间的所有着法与请求，用来重新测试。' }),
-      h('div', { class: 'row-gap' }, clearRoom),
+      h('p', {
+        class: 'hint',
+        text: '房主专属：清空 = 保留房间号，清掉全部着法与悔棋请求并回到第 1 局；关闭 = 删除房间，房间号被释放（对手会看到房间已不存在）。',
+      }),
+      h('div', { class: 'row-gap' }, clearRoom, closeRoom),
     );
   }
 
@@ -476,7 +484,9 @@ function renderRoom() {
     undoPrompt,
     undoText,
     undoStatus,
+    undoHint,
     clearRoom,
+    closeRoom,
     invite,
   });
 
@@ -486,6 +496,7 @@ function renderRoom() {
   undoPrompt.querySelector('#undo-accept').addEventListener('click', () => answerUndo(true));
   undoPrompt.querySelector('#undo-decline').addEventListener('click', () => answerUndo(false));
   if (clearRoom) clearRoom.addEventListener('click', clearRoomHistory);
+  if (closeRoom) closeRoom.addEventListener('click', closeRoomForEveryone);
   invite.parentNode.querySelector('#copy-invite').addEventListener('click', copyInvite);
 }
 
@@ -627,7 +638,8 @@ async function sync({ force = false } = {}) {
       app.store.listEvents(app.game || 1),
     ]);
     if (!roomRow) {
-      setError('房间已不存在（房主可能清空了它）。');
+      stopPoll();
+      setError(`房间 ${app.room} 已不存在：房主可能关闭了房间。点“退出房间”回到初始界面。`);
       return;
     }
     const game = Number(roomRow.game) || 1;
@@ -659,8 +671,8 @@ function applySnapshot({ roomRow, game, moveRows, eventRows, restarted }) {
   else setError('');
   const lastEvent = app.events.length ? app.events[app.events.length - 1] : null;
   if (lastEvent && lastEvent.id !== app.lastEventId) {
-    if (lastEvent.kind === EVENT.UNDO_DONE) setNotice('撤销请求已被同意。');
-    else if (lastEvent.kind === EVENT.UNDO_DECLINED) setNotice('撤销请求已被拒绝。');
+    if (lastEvent.kind === EVENT.UNDO_DONE) setNotice('悔棋请求已被同意。');
+    else if (lastEvent.kind === EVENT.UNDO_DECLINED) setNotice('悔棋请求已被拒绝。');
     app.lastEventId = lastEvent.id;
   }
   if (restarted) {
@@ -712,13 +724,20 @@ async function submit(x, y) {
 }
 
 async function requestUndo() {
-  if (!app.store || !app.moves.length) {
-    setNotice('还没有可撤销的着法。');
+  if (!app.store) return;
+  const plan = undoPlan(app.moves, app.mySide);
+  if (!plan) {
+    setNotice('你还没有落子，暂时无法悔棋。');
     return;
   }
-  const target = undoTargetFor(app.moves.length);
-  const result = await app.store.appendEvent({ game: app.game, kind: EVENT.UNDO_REQUEST, side: app.mySide, target });
-  setNotice(result.ok ? '已请求撤销，等待对手回应…' : result.reason);
+  const result = await app.store.appendEvent({ game: app.game, kind: EVENT.UNDO_REQUEST, side: app.mySide, target: plan.target });
+  setNotice(
+    result.ok
+      ? plan.removeCount === 2
+        ? '已请求悔棋（撤回双方各一手），等待对手回应…'
+        : '已请求悔棋（撤回你刚下的一手），等待对手回应…'
+      : result.reason,
+  );
   await sync({ force: true });
 }
 
@@ -738,7 +757,7 @@ async function answerUndo(accept) {
     side: app.mySide,
     target: request.target,
   });
-  setNotice(result.ok ? (accept ? '已同意撤销。' : '已拒绝撤销请求。') : result.reason);
+  setNotice(result.ok ? (accept ? '已同意悔棋。' : '已拒绝悔棋请求。') : result.reason);
   await sync({ force: true });
 }
 
@@ -754,8 +773,21 @@ async function rematch(swap) {
 async function clearRoomHistory() {
   if (!app.host) return;
   const result = await app.store.resetRoom();
-  setNotice(result.ok ? '房间已清空，可以重新开始测试。' : result.reason);
+  setNotice(result.ok ? '房间已清空（房间号保留，回到第 1 局）。' : result.reason);
   await sync({ force: true });
+}
+
+/** Host-only: delete the room so the code can be reused by someone else. */
+async function closeRoomForEveryone() {
+  if (!app.host || !app.store) return;
+  const result = await app.store.closeRoom();
+  if (!result.ok) {
+    setNotice(result.reason);
+    return;
+  }
+  const code = app.room;
+  leaveRoom();
+  setNotice(`房间 ${code} 已关闭，房间号已释放。`);
 }
 
 async function copyInvite() {
@@ -830,6 +862,37 @@ function renderHistory() {
 
 /* --------------------------------------------------------------- UI sync */
 
+/* ------------------------------------------------------------ rules modal */
+
+function openRules() {
+  const body = h('div', { class: 'modal-body help-body' });
+  renderRuleSections(body, [...GAME_RULES, ...ONLINE_CONTROLS]);
+  body.append(h('footer', { class: 'modal-footer' }, h('button', { type: 'button', onclick: closeModal }, '知道了')));
+  const modal = clear(els.modal);
+  modal.append(
+    h(
+      'header',
+      { class: 'modal-header' },
+      h('div', {}, h('h2', { text: '游戏规则' }), h('p', { class: 'modal-subtitle', text: '与单机版共用同一份规则引擎' })),
+      h('button', { type: 'button', class: 'icon-button', title: '关闭', onclick: closeModal }, '✕'),
+    ),
+    body,
+  );
+  els.modalRoot.classList.remove('hidden');
+  document.body.classList.add('modal-open');
+}
+
+function closeModal() {
+  if (els.modalRoot.classList.contains('hidden')) return;
+  els.modalRoot.classList.add('hidden');
+  document.body.classList.remove('modal-open');
+  clear(els.modal);
+}
+
+function modalOpen() {
+  return !els.modalRoot.classList.contains('hidden');
+}
+
 function syncRoomUI() {
   renderBoard();
   renderHistory();
@@ -867,20 +930,27 @@ function syncRoomUI() {
   const request = joined && state ? pendingUndo(app.events, app.moves.length) : null;
   const mine = request && request.side === app.mySide;
   const theirs = request && request.side !== app.mySide;
-  els.undoRequest.disabled = !joined || !state || state.isGameOver || app.moves.length === 0 || Boolean(request) || app.submitting;
+  const plan = joined && state ? undoPlan(app.moves, app.mySide) : null;
+  els.undoRequest.disabled = !joined || !state || state.isGameOver || !plan || Boolean(request) || app.submitting;
+  els.undoHint.textContent = !joined || !state || mine || theirs
+    ? ''
+    : state.isGameOver
+      ? '对局已结束，可以由房主开始新一局。'
+      : plan
+        ? plan.removeCount === 2
+          ? '悔棋会撤回双方各一手，回到你上一手之前（需要对手同意）。'
+          : '悔棋会撤回你刚下的一手（需要对手同意）。'
+        : '你还没有落子，暂时无法悔棋。';
   els.undoPrompt.classList.toggle('hidden', !theirs);
   if (theirs) {
-    els.undoText.textContent = `${sideLabel(request.side)} 方请求撤销最后一手（回到第 ${request.target + 1} 手之前），是否同意？`;
+    const what = request.removeCount === 2 ? '撤回双方各一手' : '撤回最后一手';
+    els.undoText.textContent = `${sideLabel(request.side)} 方请求悔棋：${what}（回到第 ${request.target + 1} 手之前），是否同意？`;
   }
   els.undoStatus.textContent = mine
-    ? '撤销请求已发出，等待对手回应…'
+    ? '悔棋请求已发出，等待对手回应…'
     : !joined || !state
       ? ''
-      : state.isGameOver
-        ? '对局结束后可以由房主开始新一局。'
-        : app.moves.length === 0
-          ? '还没有落子，无法撤销。'
-          : '';
+      : '';
 
   const over = Boolean(state && state.isGameOver);
   els.resultBanner.classList.toggle('hidden', !over);
@@ -898,6 +968,9 @@ function boot() {
   els.resultText = qs('#result-text');
   els.resultHost = qs('#result-host');
   els.resultGuest = qs('#result-guest');
+  els.modalRoot = qs('#modal-root');
+  els.modal = qs('#modal');
+  els.openRules = qs('#open-rules');
 
   app.view = new BoardView(qs('#board'), {
     onDown: (x, y, event) => {
@@ -908,6 +981,16 @@ function boot() {
 
   qs('#rematch').addEventListener('click', () => rematch(false));
   qs('#rematch-swap').addEventListener('click', () => rematch(true));
+  els.openRules.addEventListener('click', openRules);
+  els.modalRoot.addEventListener('pointerdown', (event) => {
+    if (event.target === els.modalRoot) closeModal();
+  });
+  window.addEventListener('keydown', (event) => {
+    const tag = event.target && event.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (event.key === 'Escape') closeModal();
+    else if (event.key === 'h' || event.key === 'H') openRules();
+  });
 
   const params = readParams();
   const config = loadConfig();

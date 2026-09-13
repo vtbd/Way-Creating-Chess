@@ -54,6 +54,11 @@ export function createFakeSupabase() {
         for (const row of select(db.rooms, params)) Object.assign(row, body);
         return ok([], 204);
       }
+      if (method === 'DELETE') {
+        const doomed = new Set(select(db.rooms, params));
+        db.rooms = db.rooms.filter((room) => !doomed.has(room));
+        return ok([], 204);
+      }
     }
 
     if (table === 'moves') {

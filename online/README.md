@@ -11,9 +11,10 @@
 | --- | --- |
 | 创建房间 | 房主选初始棋盘（默认 / 随机 / 粘贴 JSON）与先后手（我执先手 / 后手 / 随机） |
 | 邀请链接 | 自动带上项目 URL、anon key、房间号；对手打开即自动加入并自动执另一方 |
-| 权限区分 | 房主保留全部控制（清空房间、再来一局）；受邀方看不到连接设置与这些按钮，也看不到 URL/key 输入框 |
-| 请求撤销 | 任意一方可"请求撤销最后一手"，由对手同意/拒绝后才生效（对手若直接落子，请求自动失效） |
+| 权限区分 | 房主保留全部控制（清空房间、关闭房间、再来一局）；受邀方看不到连接设置与这些按钮，也看不到 URL/key 输入框 |
+| 悔棋 | 任意一方可"悔棋"，由对手同意/拒绝后才生效；在自己回合悔棋会撤回双方各一手（回到你上一手之前），刚下完就悔棋只撤回你那一手；对手若直接落子，请求自动失效 |
 | 再来一局 | 对局结束后房主可"再来一局"或"再来一局（交换先后手）"，双方同时重置 |
+| 关闭房间 | 房主可删除房间，房间号随之释放；对手会看到"房间已不存在" |
 | 断线/刷新 | 重新打开页面即可恢复：配置与房主身份存在浏览器本地，棋局从着法列表重放 |
 
 ---
@@ -75,6 +76,7 @@ alter table public.events enable row level security;
 drop policy if exists "online test read" on public.rooms;
 drop policy if exists "online test write" on public.rooms;
 drop policy if exists "online test update" on public.rooms;
+drop policy if exists "online test delete" on public.rooms;
 drop policy if exists "online test read" on public.moves;
 drop policy if exists "online test write" on public.moves;
 drop policy if exists "online test delete" on public.moves;
@@ -85,6 +87,7 @@ drop policy if exists "online test delete" on public.events;
 create policy "online test read" on public.rooms for select to anon using (true);
 create policy "online test write" on public.rooms for insert to anon with check (true);
 create policy "online test update" on public.rooms for update to anon using (true) with check (true);
+create policy "online test delete" on public.rooms for delete to anon using (true);
 create policy "online test read" on public.moves for select to anon using (true);
 create policy "online test write" on public.moves for insert to anon with check (true);
 create policy "online test delete" on public.moves for delete to anon using (true);
@@ -92,7 +95,7 @@ create policy "online test read" on public.events for select to anon using (true
 create policy "online test write" on public.events for insert to anon with check (true);
 create policy "online test delete" on public.events for delete to anon using (true);
 
-grant select, insert, update on public.rooms to anon;
+grant select, insert, update, delete on public.rooms to anon;
 grant select, insert, delete on public.moves to anon;
 grant select, insert, delete on public.events to anon;
 grant usage, select on all sequences in schema public to anon;
@@ -140,6 +143,7 @@ grant usage, select on all sequences in schema public to anon;
 | 房间号已存在 | 换一个房间号；或者让原房主继续用那一间 |
 | 对手看不到变化 | 检查双方"最近同步"时间是否在跳；确认房间号一致（页面自动转大写） |
 | 想彻底重开 | 房主点 **清空房间**（清空该房间所有着法与请求，局号回到 1）；或直接换个房间号 |
+| 房间会一直存在吗 | 默认一直保留在数据库里，随时可以用同一链接回到棋局。房主点 **关闭房间** 会删除该房间，房间号随即释放；想保留棋局只是换个对手，就换房间号新建一个 |
 | 免费项目会不会休眠 | Supabase 免费项目约 7 天无活动会被暂停，控制台点一下即可恢复；对局期间不受影响 |
 | 延迟 | 约 1.2 秒轮询一次，新加坡节点国内往返通常 100–300 ms，回合制完全够；想更快可调小 `online/online.js` 里的 `POLL_MS` |
 

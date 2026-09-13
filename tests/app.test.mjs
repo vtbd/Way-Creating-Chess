@@ -37,6 +37,12 @@ test('the load-failure banner reports real errors and clears on boot', () => {
   assert.match(appSource, /__wayChessBanner\.ready\(\)/, 'booting must hide the banner again');
 });
 
+test('the solo page uses the shared Chinese name and subtitle', () => {
+  assert.match(bannerHtml, /<h1>造道棋<\/h1>/);
+  assert.match(bannerHtml, /Way Creating Chess · 单机版/);
+  assert.match(bannerHtml, /<title>造道棋 · 单机版/);
+});
+
 test('the default board renders and a human move is applied', () => {
   const cells = elements.get('board').querySelectorAll('.cell');
   assert.equal(cells.length, 12 * 9, 'the 12x9 default board should render 108 cells');
