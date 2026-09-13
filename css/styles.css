@@ -447,6 +447,14 @@ button {
   border-color: rgba(255, 255, 255, 0.2);
 }
 
+/* Anchor styled as a button (e.g. the link to the online build). */
+a.link-button {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+  color: inherit;
+}
+
 .action-button[disabled],
 .ghost-button[disabled] {
   opacity: 0.45;

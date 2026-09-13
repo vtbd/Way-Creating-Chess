@@ -3,8 +3,11 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Way Creating Chess · 联机测试版</title>
-    <meta name="description" content="Way Creating Chess 的网页联机测试版：房间号对战，支持 Supabase 免费云端房间与本地双标签页测试。" />
+    <title>Way Creating Chess · 联机对战</title>
+    <meta
+      name="description"
+      content="Way Creating Chess 网页联机版：房主创建房间并决定先后手与初始棋盘，邀请链接一键加入，支持请求撤销与再来一局。"
+    />
     <link rel="icon" type="image/svg+xml" href="../assets/icon.svg" />
     <link rel="stylesheet" href="../css/styles.css" />
     <link rel="stylesheet" href="online.css" />
@@ -15,7 +18,7 @@
         <div class="brand">
           <img class="brand-icon" src="../assets/icon.svg" alt="" width="44" height="44" />
           <div class="brand-text">
-            <h1>联机测试版</h1>
+            <h1>联机对战</h1>
             <p>Way Creating Chess · 房间号对战</p>
           </div>
         </div>
@@ -25,103 +28,29 @@
         </div>
       </header>
 
-      <p class="banner">
-        这是最小可用的联机测试版：固定使用默认 12×9 棋盘、无 AI、无撤销，双方各执一方，落子通过房间同步。
-      </p>
-
       <main class="layout">
         <section class="board-panel">
+          <div id="result-banner" class="banner hidden">
+            <strong id="result-text"></strong>
+            <div id="result-host" class="row-gap hidden">
+              <button id="rematch" type="button" class="primary">再来一局</button>
+              <button id="rematch-swap" type="button">再来一局（交换先后手）</button>
+            </div>
+            <p id="result-guest" class="hint">等待房主开始新一局…</p>
+          </div>
           <div class="board-frame">
             <div id="board" class="board" aria-label="棋盘"></div>
           </div>
           <p id="notice" class="notice" aria-live="polite"></p>
         </section>
 
-        <aside class="sidebar">
-          <section class="card">
-            <h2>房间设置</h2>
-            <label class="field">
-              <span>平台</span>
-              <select id="platform" class="select">
-                <option value="local">本地标签页测试（零配置）</option>
-                <option value="supabase">Supabase 云端房间（免费）</option>
-              </select>
-            </label>
-
-            <div id="remote-fields" class="stack">
-              <label class="field">
-                <span>项目 URL</span>
-                <input id="url" class="text-input" type="text" placeholder="https://xxxx.supabase.co" />
-              </label>
-              <label class="field">
-                <span>anon key</span>
-                <input id="key" class="text-input" type="text" placeholder="Project Settings → API 里的 anon public key" />
-              </label>
-            </div>
-
-            <label class="field">
-              <span>房间号</span>
-              <input id="room" class="text-input" type="text" maxlength="8" />
-            </label>
-            <div class="row-gap">
-              <button id="rotate-room" type="button">换一个房间号</button>
-            </div>
-
-            <label class="field">
-              <span>我执</span>
-              <select id="side" class="select">
-                <option value="A">A 方（蓝，先手）</option>
-                <option value="B">B 方（红，后手）</option>
-              </select>
-            </label>
-
-            <div class="row-gap">
-              <button id="join" class="primary" type="button">进入房间</button>
-              <button id="leave" type="button">退出房间</button>
-            </div>
-            <p id="mode-hint" class="hint"></p>
-          </section>
-
-          <section class="card">
-            <h2>对局状态</h2>
-            <div id="turn-chip" class="turn-chip">—</div>
-            <p id="status-line" class="status-line">选择平台与身份后点击“进入房间”。</p>
-            <dl class="stats">
-              <div><dt>已走</dt><dd id="stat-moves">0</dd></div>
-              <div><dt>我的身份</dt><dd id="stat-side">—</dd></div>
-              <div><dt>结果</dt><dd id="stat-result">—</dd></div>
-            </dl>
-            <p id="sync-line" class="hint">尚未同步</p>
-            <p id="room-label" class="hint">未进入房间</p>
-            <p id="transport-label" class="hint">—</p>
-            <p id="error-line" class="notice notice-left"></p>
-          </section>
-
-          <section class="card">
-            <h2>邀请与同步</h2>
-            <input id="invite" class="text-input" type="text" readonly placeholder="进入房间后生成邀请链接" />
-            <div class="row-gap">
-              <button id="copy-invite" type="button">复制邀请链接</button>
-              <button id="sync" type="button">立即同步</button>
-              <button id="clear-room" type="button" class="danger-button">清空本房间</button>
-            </div>
-            <p class="hint">
-              云端模式：把链接发给对手，他打开后会自动加入同一房间。本地模式：链接只在同一浏览器里有意义
-              —— 直接再开一个标签页，填同一房间号、选另一方身份即可。
-            </p>
-          </section>
-
-          <section class="card">
-            <h2>棋谱</h2>
-            <ol id="history" class="history"></ol>
-          </section>
-        </aside>
+        <aside id="sidebar" class="sidebar"></aside>
       </main>
 
       <footer class="page-footer">
         <p>
-          联机版与单机版共用同一份规则引擎（<code>js/engine.js</code>），后端只保存“着法列表”，两边各自重放得到棋局，
-          因此刷新、断线重连、中途加入都只需要重新拉一次列表。
+          联机版与单机版共用同一份规则引擎（<code>js/engine.js</code>）：后端只保存棋盘定义与着法列表，
+          两边各自重放得到棋局，刷新与断线重连只需重新拉一次数据。
         </p>
       </footer>
     </div>

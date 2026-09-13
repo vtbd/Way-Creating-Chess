@@ -283,7 +283,7 @@ class DocumentShim extends Element {
  * Build the DOM described by a page (default `index.html`) and install
  * browser globals.
  */
-export function installDom(root = process.cwd(), { page = 'index.html' } = {}) {
+export function installDom(root = process.cwd(), { page = 'index.html', search = '' } = {}) {
   const html = readFileSync(resolve(root, page), 'utf8');
   const document = new DocumentShim();
   document._byId = new Map();
@@ -301,8 +301,8 @@ export function installDom(root = process.cwd(), { page = 'index.html' } = {}) {
       protocol: 'http:',
       origin: 'http://localhost:8000',
       pathname: `/${page}`,
-      search: '',
-      href: `http://localhost:8000/${page}`,
+      search,
+      href: `http://localhost:8000/${page}${search}`,
     },
     history: {
       replaceState: () => {},

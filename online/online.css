@@ -1,13 +1,21 @@
-/* Extra styles for the online test page; the palette and controls come from
-   the shared ../css/styles.css so both builds look identical. */
+/* Extra styles for the online page; colours and controls come from the shared
+   ../css/styles.css so both builds look identical. */
 
 .banner {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   background: rgba(62, 137, 211, 0.14);
   border: 1px solid rgba(62, 137, 211, 0.45);
   border-radius: var(--radius);
-  padding: 10px 16px;
-  font-size: 0.86rem;
+  padding: 12px 16px;
+  font-size: 0.9rem;
   color: #dbe7f4;
+}
+
+.banner strong {
+  font-size: 1.05rem;
+  color: var(--highlight);
 }
 
 .stack {
@@ -26,22 +34,90 @@
   text-align: left;
 }
 
-.row-gap button.danger-button {
+.row-gap button.danger-button,
+.danger-button {
   background: var(--danger);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 9px;
+  padding: 8px 12px;
 }
 
-.row-gap button.danger-button:hover {
+.row-gap button.danger-button:hover,
+.danger-button:hover {
   background: #a05852;
 }
 
-/* The online board is the main focus; keep it a touch smaller than the solo
-   build so the settings cards stay visible on a laptop screen. */
+.connect {
+  background: var(--panel-soft);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 8px 12px;
+}
+
+.connect summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.connect[open] summary {
+  margin-bottom: 10px;
+}
+
+.connect .field,
+.connect .hint {
+  margin-top: 8px;
+}
+
+.textarea {
+  min-height: 84px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.78rem;
+  resize: vertical;
+}
+
+.preview-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: rgba(0, 0, 0, 0.12);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+
+.preview-row .hint {
+  flex: 1 1 auto;
+}
+
+.board-preview {
+  background: var(--bg);
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.hint.is-error {
+  color: #f0a09b;
+}
+
+.undo-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: rgba(255, 224, 119, 0.12);
+  border: 1px solid rgba(255, 224, 119, 0.45);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 0.86rem;
+}
+
+/* Keep the board a touch smaller than the solo build so the cards fit on a
+   laptop screen. */
 .board {
   max-width: min(100%, calc(64vh * var(--cols) / var(--rows)));
 }
 
-.sidebar .card:first-child .field > span:first-child {
-  flex: 0 0 74px;
+.sidebar .card .field > span:first-child {
+  flex: 0 0 76px;
 }
 
 @media (max-width: 1040px) {

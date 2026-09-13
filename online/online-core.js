@@ -1,19 +1,33 @@
 /**
- * Platform-independent logic for the online test build.
+ * Platform-independent logic for the online build.
  *
  * The rules engine (`../js/engine.js`) is reused unchanged: the backend only
- * stores an ordered list of moves, and every client rebuilds the position by
- * replaying that list. Late joins, refreshes and reconnects therefore need no
- * special handling — and client and "server" can never disagree about the
- * rules, because it is literally the same code.
+ * stores the room definition plus the ordered list of moves, and every client
+ * rebuilds the position by replaying that list. Late joins, refreshes and
+ * reconnects therefore need no special handling — and the client can never
+ * disagree with the rules, because there is only one implementation.
  */
 
-import { presetBoards } from '../js/boards.js';
+import { normalizeBoardDefinition, openCount, presetBoards } from '../js/boards.js';
 import { Cell, GameState } from '../js/engine.js';
 
-/** The online test always starts from the bundled initial board. */
+/** Rooms start from the bundled initial board unless the host picks another. */
 export const ONLINE_BOARD_ID = '0';
 export const SIDES = [Cell.A, Cell.B];
+
+/** Who gets the first move: `first` = A (blue, moves first). */
+export const SIDE_CHOICES = ['first', 'second', 'random'];
+export const SIDE_CHOICE_LABELS = {
+  first: '我执先手（A 方 · 蓝）',
+  second: '我执后手（B 方 · 红）',
+  random: '随机决定',
+};
+
+export const EVENT = {
+  UNDO_REQUEST: 'undo_request',
+  UNDO_DONE: 'undo_done',
+  UNDO_DECLINED: 'undo_declined',
+};
 
 export function defaultBoard() {
   const boards = presetBoards();
@@ -27,6 +41,64 @@ export function sideLabel(side) {
 export function otherSide(side) {
   return Number(side) === Cell.A ? Cell.B : Cell.A;
 }
+
+export function sideName(side) {
+  return Number(side) === Cell.A ? '先手（A · 蓝）' : '后手（B · 红）';
+}
+
+/* --------------------------------------------------------------- identity */
+
+/** Short, unambiguous room code (no I/O/0/1 to avoid typos when read aloud). */
+export function randomRoomCode(length = 4) {
+  return randomFromAlphabet('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', length);
+}
+
+/** Secret that marks the room creator; only their link/storage carries it. */
+export function randomToken(length = 24) {
+  return randomFromAlphabet('abcdefghijklmnopqrstuvwxyz0123456789', length);
+}
+
+function randomFromAlphabet(alphabet, length) {
+  const values = new Uint32Array(length);
+  if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === 'function') {
+    globalThis.crypto.getRandomValues(values);
+  } else {
+    for (let i = 0; i < length; i += 1) values[i] = Math.floor(Math.random() * 0xffffffff);
+  }
+  let text = '';
+  for (let i = 0; i < length; i += 1) text += alphabet[values[i] % alphabet.length];
+  return text;
+}
+
+/** The host picks who moves first; the joiner always gets the other side. */
+export function resolveHostSide(choice, random = Math.random) {
+  if (choice === 'second') return Cell.B;
+  if (choice === 'random') return random() < 0.5 ? Cell.A : Cell.B;
+  return Cell.A;
+}
+
+export function isHost({ room, storedToken = null, urlToken = null } = {}) {
+  const token = room && room.host_token;
+  if (!token) return false;
+  return Boolean((storedToken && storedToken === token) || (urlToken && urlToken === token));
+}
+
+export function sideForRole(room, host) {
+  const hostSide = Number(room && room.host_side) === Cell.B ? Cell.B : Cell.A;
+  return host ? hostSide : otherSide(hostSide);
+}
+
+export function boardFromRoom(room) {
+  const raw = room && room.board;
+  const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  return normalizeBoardDefinition(data, '房间棋盘');
+}
+
+export function boardSummary(board) {
+  return `${board.name} · ${board.width}×${board.height} · 可走 ${openCount(board)} 格`;
+}
+
+/* ------------------------------------------------------------------ moves */
 
 /** Normalise whatever the backend returned into ordered move objects. */
 export function sortMoves(list) {
@@ -73,27 +145,53 @@ export function nextMove(list, board = defaultBoard()) {
   return { state, error, move: { move_index: applied, side: state.sideToMove } };
 }
 
-/** Short, unambiguous room code (no I/O/0/1 to avoid typos when read aloud). */
-export function randomRoomCode(length = 4) {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const values = new Uint32Array(length);
-  if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === 'function') {
-    globalThis.crypto.getRandomValues(values);
-  } else {
-    for (let i = 0; i < length; i += 1) values[i] = Math.floor(Math.random() * 0xffffffff);
-  }
-  let code = '';
-  for (let i = 0; i < length; i += 1) code += alphabet[values[i] % alphabet.length];
-  return code;
+/* ----------------------------------------------------------------- events */
+
+export function sortEvents(list) {
+  return (list || [])
+    .map((row) => ({
+      id: Number(row.id),
+      kind: String(row.kind || ''),
+      side: Number(row.side),
+      target: row.target === null || row.target === undefined ? null : Number(row.target),
+    }))
+    .sort((a, b) => a.id - b.id);
 }
 
-/** Invite link carrying the room code (and optionally the public API key). */
-export function buildInviteUrl({ origin, pathname, room, key, side = null }) {
-  const url = new URL(pathname, origin);
-  url.searchParams.set('room', room);
-  if (side !== null) url.searchParams.set('side', sideLabel(side));
-  if (key) url.searchParams.set('key', key);
-  return url.toString();
+export function latestEvent(list) {
+  const events = sortEvents(list);
+  return events.length ? events[events.length - 1] : null;
+}
+
+/**
+ * The undo request waiting for an answer, if any.
+ *
+ * A request is stale as soon as somebody played instead of answering, which is
+ * detectable without extra state: the requester asked while exactly one move
+ * was on the board after the target.
+ */
+export function pendingUndo(list, moveCount) {
+  const last = latestEvent(list);
+  if (!last || last.kind !== EVENT.UNDO_REQUEST) return null;
+  if (!Number.isInteger(last.target) || last.target < 0) return null;
+  if (Number(moveCount) !== last.target + 1) return null;
+  return { id: last.id, side: last.side, target: last.target };
+}
+
+/** Index the requester wants to keep: everything except the last move. */
+export function undoTargetFor(moveCount) {
+  return Math.max(0, Number(moveCount) - 1);
+}
+
+/* ---------------------------------------------------------------- display */
+
+export function buildInviteUrl({ origin, pathname, room, url = null, key = null, hostToken = null }) {
+  const invite = new URL(pathname, origin);
+  invite.searchParams.set('room', room);
+  if (url) invite.searchParams.set('url', url);
+  if (key) invite.searchParams.set('key', key);
+  if (hostToken) invite.searchParams.set('host', hostToken);
+  return invite.toString();
 }
 
 /** Human-readable summary used by the status bar. */
