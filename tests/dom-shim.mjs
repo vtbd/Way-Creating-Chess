@@ -279,9 +279,12 @@ class DocumentShim extends Element {
   }
 }
 
-/** Build the DOM described by `index.html` and install browser globals. */
-export function installDom(root = process.cwd()) {
-  const html = readFileSync(resolve(root, 'index.html'), 'utf8');
+/**
+ * Build the DOM described by a page (default `index.html`) and install
+ * browser globals.
+ */
+export function installDom(root = process.cwd(), { page = 'index.html' } = {}) {
+  const html = readFileSync(resolve(root, page), 'utf8');
   const document = new DocumentShim();
   document._byId = new Map();
   for (const match of html.matchAll(/id="([^"]+)"/g)) {
@@ -294,7 +297,16 @@ export function installDom(root = process.cwd()) {
   const storage = new Map();
   const window = {
     devicePixelRatio: 1,
-    location: { protocol: 'http:' },
+    location: {
+      protocol: 'http:',
+      origin: 'http://localhost:8000',
+      pathname: `/${page}`,
+      search: '',
+      href: `http://localhost:8000/${page}`,
+    },
+    history: {
+      replaceState: () => {},
+    },
     document,
     localStorage: {
       getItem: (key) => (storage.has(key) ? storage.get(key) : null),
@@ -317,6 +329,7 @@ export function installDom(root = process.cwd()) {
     Node: globalThis.Node,
     Element: globalThis.Element,
     Worker: globalThis.Worker,
+    localStorage: globalThis.localStorage,
   };
 
   globalThis.document = document;
@@ -324,6 +337,8 @@ export function installDom(root = process.cwd()) {
   globalThis.Node = Node;
   globalThis.Element = Element;
   globalThis.Worker = makeWorkerClass();
+  // Browsers expose `localStorage` as a global as well as on `window`.
+  globalThis.localStorage = window.localStorage;
   globalThis.__restoreDom = () => {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete globalThis[key];

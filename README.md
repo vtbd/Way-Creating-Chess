@@ -1,5 +1,7 @@
 # Way Creating Chess · 网页版
 
+本代码完全由AI编写。以下是AI给出的介绍：
+
 主文件夹（`E:\Code\Python\Way Creating Chess`）里那款 Pygame 游戏的纯静态网页版：
 零依赖、无需后端，把整个目录推到 GitHub Pages 就能直接玩。
 

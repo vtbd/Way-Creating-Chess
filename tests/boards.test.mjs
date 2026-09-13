@@ -6,8 +6,9 @@
 
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   addSavedBoard,
@@ -19,7 +20,9 @@ import {
 } from '../js/boards.js';
 import { Cell, GameState } from '../js/engine.js';
 
-const PYTHON_PROJECT = resolve(process.cwd(), '..', '..', 'Python', 'Way Creating Chess');
+// Resolve relative to this file so the suite works from any working directory.
+const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const PYTHON_PROJECT = resolve(webRoot, '..', '..', 'Python', 'Way Creating Chess');
 
 test('only the project default board is bundled as a preset', () => {
   const boards = presetBoards();

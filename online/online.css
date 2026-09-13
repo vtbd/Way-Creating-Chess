@@ -1,0 +1,51 @@
+/* Extra styles for the online test page; the palette and controls come from
+   the shared ../css/styles.css so both builds look identical. */
+
+.banner {
+  background: rgba(62, 137, 211, 0.14);
+  border: 1px solid rgba(62, 137, 211, 0.45);
+  border-radius: var(--radius);
+  padding: 10px 16px;
+  font-size: 0.86rem;
+  color: #dbe7f4;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.link-button {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+.notice-left {
+  text-align: left;
+}
+
+.row-gap button.danger-button {
+  background: var(--danger);
+}
+
+.row-gap button.danger-button:hover {
+  background: #a05852;
+}
+
+/* The online board is the main focus; keep it a touch smaller than the solo
+   build so the settings cards stay visible on a laptop screen. */
+.board {
+  max-width: min(100%, calc(64vh * var(--cols) / var(--rows)));
+}
+
+.sidebar .card:first-child .field > span:first-child {
+  flex: 0 0 74px;
+}
+
+@media (max-width: 1040px) {
+  .board {
+    max-width: min(100%, 520px);
+  }
+}

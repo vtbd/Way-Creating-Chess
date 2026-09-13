@@ -9,11 +9,15 @@
  */
 
 import assert from 'node:assert/strict';
+import { dirname, resolve } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { findByText, installDom } from './dom-shim.mjs';
 
-const dom = installDom(process.cwd());
+// Resolve relative to this file so the suite works from any working directory.
+const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const dom = installDom(webRoot);
 const { elements } = dom;
 
 // Importing app.js runs `boot()`, exactly like loading the page.
