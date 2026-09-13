@@ -10,6 +10,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import test, { after } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -37,6 +38,9 @@ const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const fake = createFakeSupabase();
 globalThis.fetch = fake.fetchImpl;
 
+const bannerHtml = readFileSync(resolve(webRoot, 'online/index.html'), 'utf8');
+const pageSource = readFileSync(resolve(webRoot, 'online/online.js'), 'utf8');
+
 const settle = async (turns = 10) => {
   for (let i = 0; i < turns; i += 1) await new Promise((done) => setTimeout(done, 0));
 };
@@ -63,6 +67,16 @@ after(() => {
 });
 
 /* ------------------------------------------------------------------ core */
+
+test('the load-failure banner reports real errors and clears on boot', () => {
+  assert.match(bannerHtml, /id="boot-warning-title"/);
+  assert.match(bannerHtml, /id="boot-warning-detail"/);
+  assert.match(bannerHtml, /__wayChessBanner/);
+  assert.match(bannerHtml, /addEventListener\(\s*'error'/, 'failed resources must be reported');
+  assert.match(bannerHtml, /unhandledrejection/);
+  assert.match(pageSource, /__wayChessBanner\.ready\(\)/, 'booting must hide the banner again');
+  assert.match(pageSource, /启动失败/, 'a startup exception must be surfaced');
+});
 
 test('a move list replays into the same position as the solo engine', () => {
   const rows = [

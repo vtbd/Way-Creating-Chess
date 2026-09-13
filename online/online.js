@@ -923,7 +923,27 @@ function boot() {
     // Opened from an invite link (or refreshed mid-game): join straight away.
     joinRoom();
   }
-  window.__onlineBooted = true;
+  notifyReady();
 }
 
-boot();
+/** Tells the inline boot-warning script (see index.html) that the page loaded. */
+function notifyReady() {
+  window.__wayChessBooted = true;
+  window.__onlineBooted = true;
+  if (window.__wayChessBanner && typeof window.__wayChessBanner.ready === 'function') {
+    window.__wayChessBanner.ready();
+  }
+}
+
+try {
+  boot();
+} catch (error) {
+  if (window.__wayChessBanner && typeof window.__wayChessBanner.show === 'function') {
+    window.__wayChessBanner.show(
+      '启动失败',
+      error && error.message ? error.message : String(error),
+      '按 F12 打开控制台查看完整堆栈。',
+    );
+  }
+  throw error;
+}

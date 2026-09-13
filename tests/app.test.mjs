@@ -9,6 +9,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -20,11 +21,21 @@ const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const dom = installDom(webRoot);
 const { elements } = dom;
 
+const bannerHtml = readFileSync(resolve(webRoot, 'index.html'), 'utf8');
+const appSource = readFileSync(resolve(webRoot, 'js/app.js'), 'utf8');
+
 // Importing app.js runs `boot()`, exactly like loading the page.
 await import('../js/app.js');
 
 const cellNode = (x, y) => elements.get('board').querySelectorAll('.cell').find((cell) => cell.dataset.x === String(x) && cell.dataset.y === String(y));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test('the load-failure banner reports real errors and clears on boot', () => {
+  assert.match(bannerHtml, /id="boot-warning-title"/);
+  assert.match(bannerHtml, /__wayChessBanner/);
+  assert.match(bannerHtml, /addEventListener\(\s*'error'/, 'failed resources must be reported');
+  assert.match(appSource, /__wayChessBanner\.ready\(\)/, 'booting must hide the banner again');
+});
 
 test('the default board renders and a human move is applied', () => {
   const cells = elements.get('board').querySelectorAll('.cell');

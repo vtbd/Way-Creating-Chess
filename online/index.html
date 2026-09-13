@@ -44,7 +44,12 @@
           <p id="notice" class="notice" aria-live="polite"></p>
         </section>
 
-        <aside id="sidebar" class="sidebar"></aside>
+        <aside id="sidebar" class="sidebar">
+          <section class="card">
+            <h2>正在加载…</h2>
+            <p class="hint">正在下载联机模块，请稍候。若长时间没有反应，请按 F12 查看控制台。</p>
+          </section>
+        </aside>
       </main>
 
       <footer class="page-footer">
@@ -56,19 +61,78 @@
     </div>
 
     <div id="boot-warning" class="boot-warning hidden">
-      <h2>需要通过本地服务器或 GitHub Pages 打开</h2>
-      <p>这个页面使用 ES 模块，直接双击 <code>online/index.html</code>（<code>file://</code>）会被浏览器拦截。</p>
-      <pre>node tools/serve.mjs</pre>
-      <p>然后访问 <code>http://localhost:8000/online/</code>。</p>
+      <div class="boot-warning-head">
+        <h2 id="boot-warning-title"></h2>
+        <button type="button" class="icon-button" title="关闭提示" onclick="document.getElementById('boot-warning').classList.add('hidden')">✕</button>
+      </div>
+      <p id="boot-warning-detail"></p>
+      <p id="boot-warning-steps" class="hint"></p>
     </div>
 
     <script>
       (function () {
         var warning = document.getElementById('boot-warning');
-        if (window.location.protocol === 'file:') warning.classList.remove('hidden');
+        var title = document.getElementById('boot-warning-title');
+        var detail = document.getElementById('boot-warning-detail');
+        var steps = document.getElementById('boot-warning-steps');
+
+        function show(heading, message, hint) {
+          title.textContent = heading;
+          detail.textContent = message || '';
+          steps.textContent = hint || '';
+          warning.classList.remove('hidden');
+        }
+
+        // The page calls `ready()` as soon as the module finished booting, so a
+        // slow start never leaves a stale warning on screen.
+        window.__wayChessBanner = {
+          show: show,
+          ready: function () {
+            window.__wayChessBooted = true;
+            warning.classList.add('hidden');
+          },
+        };
+
+        if (window.location.protocol === 'file:') {
+          show(
+            '需要通过本地服务器或 GitHub Pages 打开',
+            '这个页面使用了 ES 模块，直接双击 online/index.html（file://）会被浏览器拦截。',
+            '在项目目录执行 node tools/serve.mjs，然后访问 http://localhost:8000/online/。',
+          );
+        }
+
+        // A failed <script>/<link> (404, wrong MIME type, offline) surfaces here
+        // with the exact URL, which is far more useful than a generic message.
+        window.addEventListener(
+          'error',
+          function (event) {
+            var target = event.target;
+            if (target && (target.tagName === 'SCRIPT' || target.tagName === 'LINK')) {
+              show(
+                '有文件加载失败',
+                '加载 ' + (target.src || target.href) + ' 时出错（常见原因：404 或 MIME 类型不对）。',
+                '请确认 online/ 与 js/ 目录下的文件都已推送到 GitHub Pages，并在 F12 → Console / Network 里查看具体状态码。',
+              );
+            } else if (event.message) {
+              show('页面脚本出错', event.message, '按 F12 打开控制台查看第一条红色错误的完整堆栈。');
+            }
+          },
+          true,
+        );
+        window.addEventListener('unhandledrejection', function (event) {
+          var reason = event.reason && (event.reason.message || event.reason);
+          show('页面脚本出错', String(reason || '未处理的 Promise 异常'), '按 F12 打开控制台查看完整堆栈。');
+        });
+
         window.setTimeout(function () {
-          if (!window.__onlineBooted) warning.classList.remove('hidden');
-        }, 1500);
+          if (!window.__wayChessBooted) {
+            show(
+              '页面还没有启动完成',
+              '联机模块可能仍在下载（网络较慢），也可能加载失败。',
+              '稍等几秒；若一直没有反应，请按 F12 查看 Console / Network 的报错，并确认 online/ 与 js/ 目录下的文件都已上传。',
+            );
+          }
+        }, 6000);
       })();
     </script>
     <script type="module" src="online.js"></script>

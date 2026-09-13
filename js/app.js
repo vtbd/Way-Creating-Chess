@@ -1223,8 +1223,26 @@ function boot() {
   });
 
   window.setInterval(tick, 100);
-  // Tells the inline boot-warning script (see index.html) that the app loaded.
-  window.__wayChessBooted = true;
+  notifyReady();
 }
 
-boot();
+/** Tells the inline boot-warning script (see index.html) that the app loaded. */
+function notifyReady() {
+  window.__wayChessBooted = true;
+  if (window.__wayChessBanner && typeof window.__wayChessBanner.ready === 'function') {
+    window.__wayChessBanner.ready();
+  }
+}
+
+try {
+  boot();
+} catch (error) {
+  if (window.__wayChessBanner && typeof window.__wayChessBanner.show === 'function') {
+    window.__wayChessBanner.show(
+      '启动失败',
+      error && error.message ? error.message : String(error),
+      '按 F12 打开控制台查看完整堆栈。',
+    );
+  }
+  throw error;
+}

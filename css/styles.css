@@ -903,6 +903,17 @@ a.link-button {
   font-size: 0.82rem;
 }
 
+.boot-warning-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.boot-warning-head h2 {
+  font-size: 1rem;
+}
+
 /* ----------------------------------------------------------- responsive */
 
 @media (max-width: 1040px) {

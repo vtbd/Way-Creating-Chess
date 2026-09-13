@@ -88,26 +88,78 @@
     </div>
 
     <div id="boot-warning" class="boot-warning hidden">
-      <h2>需要通过本地服务器或 GitHub Pages 打开</h2>
-      <p>
-        这个页面使用了 ES 模块与 Web Worker，直接双击 <code>index.html</code>（<code>file://</code>
-        ）会被浏览器拦截。请在项目目录执行任意一条命令，再访问提示的地址：
-      </p>
-      <pre>node tools/serve.mjs</pre>
-      <pre>npx serve .        （或：py -m http.server 8000）</pre>
-      <p>然后打开 <code>http://localhost:8000/</code>。部署到 GitHub Pages 后可直接访问网址，无需任何额外配置。</p>
+      <div class="boot-warning-head">
+        <h2 id="boot-warning-title"></h2>
+        <button type="button" class="icon-button" title="关闭提示" onclick="document.getElementById('boot-warning').classList.add('hidden')">✕</button>
+      </div>
+      <p id="boot-warning-detail"></p>
+      <p id="boot-warning-steps" class="hint"></p>
     </div>
 
     <script>
       (function () {
         var warning = document.getElementById('boot-warning');
-        function reveal() {
+        var title = document.getElementById('boot-warning-title');
+        var detail = document.getElementById('boot-warning-detail');
+        var steps = document.getElementById('boot-warning-steps');
+
+        function show(heading, message, hint) {
+          title.textContent = heading;
+          detail.textContent = message || '';
+          steps.textContent = hint || '';
           warning.classList.remove('hidden');
         }
-        if (window.location.protocol === 'file:') reveal();
+
+        // The page calls `ready()` once the module has booted, so a slow start
+        // never leaves a stale warning on screen.
+        window.__wayChessBanner = {
+          show: show,
+          ready: function () {
+            window.__wayChessBooted = true;
+            warning.classList.add('hidden');
+          },
+        };
+
+        if (window.location.protocol === 'file:') {
+          show(
+            '需要通过本地服务器或 GitHub Pages 打开',
+            '这个页面使用了 ES 模块与 Web Worker，直接双击 index.html（file://）会被浏览器拦截。',
+            '在项目目录执行 node tools/serve.mjs（或 npx serve .、py -m http.server 8000），再访问提示的地址。',
+          );
+        }
+
+        // A failed <script>/<link> (404, wrong MIME type, offline) surfaces here
+        // with the exact URL, which is far more useful than a generic message.
+        window.addEventListener(
+          'error',
+          function (event) {
+            var target = event.target;
+            if (target && (target.tagName === 'SCRIPT' || target.tagName === 'LINK')) {
+              show(
+                '有文件加载失败',
+                '加载 ' + (target.src || target.href) + ' 时出错（常见原因：404 或 MIME 类型不对）。',
+                '请确认 js/、css/ 目录下的文件都已推送到 GitHub Pages，并在 F12 → Console / Network 里查看具体状态码。',
+              );
+            } else if (event.message) {
+              show('页面脚本出错', event.message, '按 F12 打开控制台查看第一条红色错误的完整堆栈。');
+            }
+          },
+          true,
+        );
+        window.addEventListener('unhandledrejection', function (event) {
+          var reason = event.reason && (event.reason.message || event.reason);
+          show('页面脚本出错', String(reason || '未处理的 Promise 异常'), '按 F12 打开控制台查看完整堆栈。');
+        });
+
         window.setTimeout(function () {
-          if (!window.__wayChessBooted) reveal();
-        }, 1500);
+          if (!window.__wayChessBooted) {
+            show(
+              '页面还没有启动完成',
+              '模块可能仍在下载（网络较慢），也可能加载失败。',
+              '稍等几秒；若一直没有反应，请按 F12 查看 Console / Network 的报错，并确认 js/ 目录下的文件都已上传。',
+            );
+          }
+        }, 6000);
       })();
     </script>
     <script type="module" src="js/app.js"></script>
