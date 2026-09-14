@@ -29,6 +29,19 @@
 
       <main class="layout">
         <section class="board-panel">
+          <div id="clock-bar" class="clock-bar">
+            <div id="clock-a" class="clock-side">
+              <span id="clock-name-a" class="clock-name">A 方</span>
+              <span id="clock-main-a" class="clock-main">10:00</span>
+              <span id="clock-move-a" class="clock-move">步时 90 秒</span>
+            </div>
+            <span class="clock-vs">对局时间</span>
+            <div id="clock-b" class="clock-side">
+              <span id="clock-name-b" class="clock-name">B 方</span>
+              <span id="clock-main-b" class="clock-main">10:00</span>
+              <span id="clock-move-b" class="clock-move">步时 90 秒</span>
+            </div>
+          </div>
           <div id="result-banner" class="banner hidden">
             <strong id="result-text"></strong>
             <div id="result-host" class="row-gap hidden">
@@ -39,6 +52,7 @@
           </div>
           <div class="board-frame">
             <div id="board" class="board" aria-label="棋盘"></div>
+            <div id="countdown" class="countdown hidden"></div>
           </div>
           <p id="notice" class="notice" aria-live="polite"></p>
         </section>

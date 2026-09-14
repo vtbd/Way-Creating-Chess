@@ -18,6 +18,9 @@ import { Cell } from '../js/engine.js';
 import { drawMiniBoard } from '../js/preview.js';
 import { GAME_RULES, ONLINE_CONTROLS, renderRuleSections } from '../js/rules.js';
 import {
+  CLOCK_DEFAULTS,
+  CLOCK_LIMITS,
+  COUNTDOWN_MS,
   EVENT,
   ROLE,
   ROLE_LABELS,
@@ -27,14 +30,21 @@ import {
   boardFromRoom,
   boardSummary,
   buildInviteUrl,
+  clockState,
+  clockTimeout,
   defaultBoard,
   describe,
+  formatClock,
+  formatStep,
   isHost,
   nicknameForSide,
+  otherSide,
   pendingUndo,
   randomRoomCode,
   randomToken,
+  readinessFor,
   rebuild,
+  recordedTimeout,
   resolveHostSide,
   roleFor,
   sideForRoleName,
@@ -48,9 +58,13 @@ const CONFIG_KEY = 'wcc.online.config.v2';
 const HOST_KEY = (room) => `wcc.online.host.${room}`;
 const DEVICE_KEY = 'wcc.online.device.v1';
 const NICKNAME_KEY = 'wcc.online.nickname.v1';
-const POLL_MS = 1200;
+/** Clocks are derived from database timestamps, so a faster poll keeps both
+    devices within a fraction of a second of each other. */
+const POLL_MS = 700;
 /** Presence heartbeat interval (multiples of the poll). */
-const HEARTBEAT_EVERY = 2;
+const HEARTBEAT_EVERY = 3;
+/** Local clock repaint interval (no network involved). */
+const CLOCK_TICK_MS = 200;
 
 const app = {
   phase: 'setup',
@@ -60,6 +74,7 @@ const app = {
   urlToken: '',
   device: '',
   nickname: '',
+  hostToken: '',
   role: null,
   members: [],
   serverTime: 0,
@@ -69,6 +84,14 @@ const app = {
   lastNames: new Map(),
   presenceReady: false,
   pollCount: 0,
+  serverOffset: 0,
+  readiness: null,
+  clock: null,
+  outcome: null,
+  frozenAt: null,
+  readyGame: 0,
+  timeoutPosted: false,
+  postingTimeout: false,
   store: null,
   roomRow: null,
   board: null,
@@ -217,7 +240,9 @@ function storeOptions() {
 const ROLE_ORDER = { [ROLE.HOST]: 0, [ROLE.GUEST]: 1, [ROLE.SPECTATOR]: 2 };
 
 function isHostDevice() {
-  return isHost({ room: app.roomRow, storedToken: loadHostToken(), urlToken: app.urlToken });
+  // The poll only fetches a few room fields, so the token is remembered from
+  // the full row we read when entering (or creating) the room.
+  return isHost({ room: { host_token: app.hostToken }, storedToken: loadHostToken(), urlToken: app.urlToken });
 }
 
 /**
@@ -231,35 +256,55 @@ async function refreshPresence({ force = false } = {}) {
   if (!app.store || !app.roomRow) return;
   if (!force && app.pollCount % HEARTBEAT_EVERY !== 0) return;
 
+  // Read first, decide second: the seat must be chosen from fresh rows, or a
+  // spectator that just took the opponent seat would fall back to watching.
+  const { members, serverTime } = await app.store.listMembers();
+  app.members = members;
+  app.serverOffset = serverTime - Date.now();
   const host = isHostDevice();
   let role = roleFor({
     room: app.roomRow,
-    members: app.members,
+    members,
     device: app.device,
-    serverTimeMs: app.serverTime || Date.now(),
+    serverTimeMs: serverTime,
     isHostDevice: host,
   });
   let side = sideForRoleName(app.roomRow, role);
-  let result = await app.store.heartbeat({ device: app.device, nickname: app.nickname, role, side });
+  // The heartbeat must carry the ready flag, otherwise it would clear it.
+  let result = await app.store.heartbeat({
+    device: app.device,
+    nickname: app.nickname,
+    role,
+    side,
+    readyGame: app.readyGame,
+  });
   if (!result.ok && result.conflict) {
     role = ROLE.SPECTATOR;
     side = null;
-    result = await app.store.heartbeat({ device: app.device, nickname: app.nickname, role, side });
+    result = await app.store.heartbeat({
+      device: app.device,
+      nickname: app.nickname,
+      role,
+      side,
+      readyGame: 0,
+    });
   }
   if (!result.ok) {
     setError(result.reason);
     return;
   }
 
-  const { members, serverTime } = await app.store.listMembers();
   applyRoster({ members, serverTime, role, side });
 }
 
 function applyRoster({ members, serverTime, role, side }) {
+  app.serverOffset = serverTime - Date.now();
   app.members = members;
   app.serverTime = serverTime;
   app.role = role;
   app.mySide = side;
+  const fetched = members.find((member) => member.device === app.device) || null;
+  if (fetched) app.readyGame = Number(fetched.ready_game) || app.readyGame;
   const self = {
     device: app.device,
     nickname: app.nickname,
@@ -267,6 +312,8 @@ function applyRoster({ members, serverTime, role, side }) {
     side,
     joined_at: (app.meRow && app.meRow.joined_at) || new Date(serverTime).toISOString(),
     last_seen: new Date(serverTime).toISOString(),
+    ready_game: app.readyGame,
+    ready_at: (fetched && fetched.ready_at) || new Date(serverTime).toISOString(),
   };
   app.meRow = self;
   app.roster = activeMembers([...members.filter((member) => member.device !== app.device), self], serverTime).sort(
@@ -274,6 +321,138 @@ function applyRoster({ members, serverTime, role, side }) {
   );
   for (const member of app.roster) app.lastNames.set(member.device, member.nickname);
   announcePresenceChanges();
+}
+
+/* ----------------------------------------------------------------- clock */
+
+/** Server clock, extrapolated locally between polls for smooth countdowns. */
+function estimatedServerNow() {
+  return Date.now() + app.serverOffset;
+}
+
+/** Combine the engine result with a possible clock timeout. */
+function outcomeOf(state, events) {
+  const loser = recordedTimeout(events);
+  if (loser !== null && loser !== undefined && !Number.isNaN(loser)) {
+    return { over: true, winner: otherSide(loser), reason: 'timeout', loser };
+  }
+  if (state.winner !== null) return { over: true, winner: state.winner, reason: 'win', loser: null };
+  if (state.isDraw) return { over: true, winner: null, reason: 'draw', loser: null };
+  return { over: false, winner: null, reason: null, loser: null };
+}
+
+function refreshReadiness() {
+  app.readiness = app.roomRow
+    ? readinessFor({ members: app.members, serverTimeMs: estimatedServerNow(), game: app.game || 1 })
+    : null;
+  return app.readiness;
+}
+
+function updateClockUI() {
+  if (app.phase !== 'room' || !app.roomRow) return;
+  const readiness = refreshReadiness();
+  const now = estimatedServerNow();
+  const startAt = readiness.bothReady ? readiness.startAt : null;
+  const clock = clockState({
+    moves: app.moves,
+    room: app.roomRow,
+    startAt,
+    serverTimeMs: now,
+    frozenAt: app.outcome && app.outcome.over ? app.frozenAt : null,
+  });
+  app.clock = clock;
+  renderClockBar(clock, readiness);
+  renderCountdown(readiness, clock);
+  maybeReportTimeout(clock, readiness);
+}
+
+function renderClockBar(clock, readiness) {
+  const { hostSide, guestSide } = sideOrder();
+  const names = {
+    [hostSide]: (readiness.host && readiness.host.nickname) || '房主',
+    [guestSide]: (readiness.guest && readiness.guest.nickname) || '等待对手',
+  };
+  const live = readiness.live;
+  const over = Boolean(app.outcome && app.outcome.over);
+  for (const side of [Cell.A, Cell.B]) {
+    const parts = els.clocks[side];
+    if (!parts || !parts.main) continue;
+    const node = parts.node;
+    const isTurn = live && !over && clock.sideToMove === side;
+    node.classList.toggle('is-turn', isTurn);
+    if (parts.name) parts.name.textContent = `${sideLabel(side)} 方 · ${names[side] || '—'}`;
+    parts.main.textContent = formatClock(clock.remaining[side]);
+    parts.main.classList.toggle('is-low', clock.remaining[side] <= 30000);
+    if (parts.move) {
+      parts.move.textContent = isTurn ? `步时 ${formatClock(clock.stepRemaining)}` : `步时 ${formatStep(clock.moveMs)}`;
+    }
+  }
+  els.clockBar.classList.toggle('is-live', live);
+}
+
+function sideOrder() {
+  const hostSide = Number(app.roomRow && app.roomRow.host_side) === Cell.B ? Cell.B : Cell.A;
+  return { hostSide, guestSide: otherSide(hostSide) };
+}
+
+function renderCountdown(readiness, clock) {
+  if (!els.countdown) return;
+  const over = app.outcome && app.outcome.over;
+  if (!readiness.bothReady || readiness.live || over) {
+    els.countdown.classList.add('hidden');
+    return;
+  }
+  const seconds = Math.ceil(readiness.countdownLeft / 1000);
+  els.countdown.classList.remove('hidden');
+  els.countdown.textContent = String(Math.max(1, seconds));
+  void clock;
+}
+
+/** Any client may declare a timeout; the event log keeps it once. */
+async function maybeReportTimeout(clock, readiness) {
+  if (!app.store || app.postingTimeout || app.timeoutPosted) return;
+  if (app.outcome && app.outcome.over) return;
+  const loser = clockTimeout(clock, { live: readiness.live });
+  if (loser === null) return;
+  app.postingTimeout = true;
+  try {
+    const result = await app.store.appendEvent({
+      game: app.game,
+      kind: EVENT.CLOCK_TIMEOUT,
+      side: loser,
+      target: null,
+    });
+    if (result.ok) {
+      app.timeoutPosted = true;
+      setNotice(`${sideLabel(loser)} 方超时，${sideLabel(otherSide(loser))} 方获胜。`);
+      await sync({ force: true });
+    }
+  } catch (error) {
+    /* the next tick retries */
+  } finally {
+    app.postingTimeout = false;
+  }
+}
+
+/** Ready / cancel-ready for the current game. */
+async function toggleReady() {
+  if (!app.store || app.role === ROLE.SPECTATOR) return;
+  const next = app.readyGame >= (app.game || 1) ? 0 : app.game || 1;
+  app.readyGame = next;
+  const result = await app.store.heartbeat({
+    device: app.device,
+    nickname: app.nickname,
+    role: app.role,
+    side: app.mySide,
+    readyGame: next,
+  });
+  if (!result.ok) {
+    setNotice(result.reason);
+    return;
+  }
+  setNotice(next ? '已准备完毕，等待对手…' : '已取消准备。');
+  await refreshPresence({ force: true });
+  syncRoomUI();
 }
 
 /** Tell the table when somebody joins or leaves. */
@@ -314,9 +493,21 @@ async function takeSeat() {
   if (stale) await app.store.dropMember(stale.device);
 
   const side = sideForRoleName(app.roomRow, ROLE.GUEST);
-  const result = await app.store.heartbeat({ device: app.device, nickname: app.nickname, role: ROLE.GUEST, side });
+  const result = await app.store.heartbeat({
+    device: app.device,
+    nickname: app.nickname,
+    role: ROLE.GUEST,
+    side,
+    readyGame: 0, // taking a seat always starts un-ready
+  });
   if (!result.ok) {
-    await app.store.heartbeat({ device: app.device, nickname: app.nickname, role: ROLE.SPECTATOR, side: null });
+    await app.store.heartbeat({
+      device: app.device,
+      nickname: app.nickname,
+      role: ROLE.SPECTATOR,
+      side: null,
+      readyGame: 0,
+    });
     setNotice('对手座位刚被其他人坐上，你继续观战。');
   } else {
     setNotice(`已接替对手，你执${sideName(side)}。`);
@@ -400,6 +591,25 @@ function renderSetup() {
   const previewCanvas = h('canvas', { class: 'board-preview' });
   const previewInfo = h('p', { class: 'hint' });
 
+  const mainMinutes = h('input', {
+    id: 'main-minutes',
+    class: 'text-input small',
+    type: 'number',
+    min: '1',
+    max: '120',
+    step: '1',
+    value: String(Math.round(CLOCK_DEFAULTS.mainMs / 60000)),
+  });
+  const moveSeconds = h('input', {
+    id: 'move-seconds',
+    class: 'text-input small',
+    type: 'number',
+    min: '10',
+    max: '600',
+    step: '5',
+    value: String(Math.round(CLOCK_DEFAULTS.moveMs / 1000)),
+  });
+
   const hostSide = h(
     'select',
     { id: 'host-side', class: 'select' },
@@ -420,6 +630,9 @@ function renderSetup() {
     randomFields,
     jsonField,
     h('div', { class: 'preview-row' }, previewCanvas, previewInfo),
+    h('label', { class: 'field' }, h('span', { text: '局时' }), mainMinutes, h('span', { class: 'hint', text: '分钟' })),
+    h('label', { class: 'field' }, h('span', { text: '步时' }), moveSeconds, h('span', { class: 'hint', text: '秒' })),
+    h('p', { class: 'hint', text: '局时用尽或单步超过步时都判负；房主创建后不能再改。' }),
     h('label', { class: 'field' }, h('span', { text: '先后手' }), hostSide),
     h(
       'div',
@@ -446,6 +659,8 @@ function renderSetup() {
   els.boardSeed = randomFields.querySelector('#board-seed');
   els.boardJson = jsonField.querySelector('#board-json');
   els.hostSide = hostSide;
+  els.mainMinutes = mainMinutes;
+  els.moveSeconds = moveSeconds;
   els.roomInput = roomInput;
   els.createRoom = sidebarCards.querySelector('#create-room');
   els.joinRoom = sidebarCards.querySelector('#join-room');
@@ -520,6 +735,22 @@ function clearCanvas(canvas) {
 function readConnectFields() {
   if (els.url) app.url = els.url.value.trim();
   if (els.key) app.key = els.key.value.trim();
+}
+
+/** Read the host's clock fields, clamped to the documented ranges. */
+function readClockFields() {
+  const clamp = (value, { min, max }, fallback) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return fallback;
+    return Math.min(max, Math.max(min, Math.round(number)));
+  };
+  const mainMinutes = clamp(els.mainMinutes && els.mainMinutes.value, { min: 1, max: 120 }, 10);
+  const moveSeconds = clamp(els.moveSeconds && els.moveSeconds.value, { min: 10, max: 600 }, 90);
+  const mainMs = Math.min(CLOCK_LIMITS.mainMs.max, Math.max(CLOCK_LIMITS.mainMs.min, mainMinutes * 60000));
+  const moveMs = Math.min(CLOCK_LIMITS.moveMs.max, Math.max(CLOCK_LIMITS.moveMs.min, moveSeconds * 1000));
+  if (els.mainMinutes) els.mainMinutes.value = String(Math.round(mainMs / 60000));
+  if (els.moveSeconds) els.moveSeconds.value = String(Math.round(moveMs / 1000));
+  return { mainMs, moveMs };
 }
 
 function syncBoardUI() {
@@ -597,10 +828,14 @@ function renderRoom() {
     ),
   );
   const undoStatus = h('p', { id: 'undo-status', class: 'hint' });
+  const readyButton = h('button', { id: 'ready-button', class: 'action-button wide', type: 'button' }, '准备完毕');
+  const readyHint = h('p', { id: 'ready-hint', class: 'hint' });
   const actionsCard = h(
     'section',
     { class: 'card' },
     h('h2', { text: '对局操作' }),
+    readyButton,
+    readyHint,
     undoRequest,
     undoHint,
     undoPrompt,
@@ -662,6 +897,8 @@ function renderRoom() {
     undoText,
     undoStatus,
     undoHint,
+    readyButton,
+    readyHint,
     clearRoom,
     closeRoom,
     rosterList,
@@ -674,6 +911,7 @@ function renderRoom() {
   roomCard.querySelector('#change-nickname-room').addEventListener('click', () => askNickname());
   takeSeatButton.addEventListener('click', takeSeat);
   undoRequest.addEventListener('click', requestUndo);
+  readyButton.addEventListener('click', toggleReady);
   undoPrompt.querySelector('#undo-accept').addEventListener('click', () => answerUndo(true));
   undoPrompt.querySelector('#undo-decline').addEventListener('click', () => answerUndo(false));
   if (clearRoom) clearRoom.addEventListener('click', clearRoomHistory);
@@ -703,20 +941,30 @@ async function createRoom() {
     const store = createSupabaseStore(storeOptions());
     const hostToken = randomToken();
     const hostSide = resolveHostSide(els.hostSide.value);
-    const result = await store.createRoom({ board: toBoardPayload(board), hostToken, hostSide });
+    const { mainMs, moveMs } = readClockFields();
+    const result = await store.createRoom({ board: toBoardPayload(board), hostToken, hostSide, mainMs, moveMs });
     if (!result.ok) {
       setError(result.reason);
       return;
     }
     app.store = store;
     app.urlToken = hostToken;
+    app.hostToken = hostToken;
     saveHostToken(app.room, hostToken);
     saveConfig();
     setError('');
     setNotice(`房间 ${app.room} 已创建，把邀请链接发给对手吧。`);
     // Hand the freshly created row over so the host UI (and its controls)
     // renders before the first poll returns.
-    await enterRoom({ code: app.room, board: toBoardPayload(board), host_token: hostToken, host_side: hostSide, game: 1 });
+    await enterRoom({
+      code: app.room,
+      board: toBoardPayload(board),
+      host_token: hostToken,
+      host_side: hostSide,
+      game: 1,
+      main_ms: mainMs,
+      move_ms: moveMs,
+    });
   } catch (error) {
     setError(error.message);
   } finally {
@@ -747,6 +995,7 @@ async function joinRoom() {
       return;
     }
     app.store = store;
+    app.hostToken = roomRow.host_token || '';
     saveConfig();
     setError('');
     await enterRoom(roomRow);
@@ -768,12 +1017,21 @@ async function enterRoom(roomRow = null) {
   app.moves = [];
   app.events = [];
   app.state = null;
+  // The poll only returns a few room columns, so the board is captured here
+  // from the full row (creator or joiner) and kept for the rest of the game.
+  app.board = roomRow && roomRow.board ? boardFromRoom(roomRow) : defaultBoard();
   app.members = [];
   app.roster = [];
   app.seenDevices = new Set();
   app.lastNames = new Map();
   app.presenceReady = false;
   app.pollCount = 0;
+  app.readiness = null;
+  app.clock = null;
+  app.outcome = null;
+  app.frozenAt = null;
+  app.readyGame = 0;
+  app.timeoutPosted = false;
   app.host = Boolean(roomRow && isHost({ room: roomRow, storedToken: loadHostToken(), urlToken: app.urlToken }));
   app.role = app.host ? ROLE.HOST : null;
   app.mySide = app.host ? sideForRoleName(roomRow, ROLE.HOST) : null;
@@ -809,6 +1067,14 @@ function leaveRoom() {
   app.lastNames = new Map();
   app.presenceReady = false;
   app.meRow = null;
+  app.hostToken = '';
+  app.readiness = null;
+  app.clock = null;
+  app.outcome = null;
+  app.frozenAt = null;
+  app.readyGame = 0;
+  app.timeoutPosted = false;
+  app.pollCount = 0;
   app.game = null;
   app.host = false;
   app.role = null;
@@ -843,7 +1109,7 @@ async function sync({ force = false } = {}) {
   app.pollCount += 1;
   try {
     const [roomRow, moveRows, eventRows] = await Promise.all([
-      app.store.getRoom(),
+      app.store.getRoomState(),
       app.store.listMoves(app.game || 1),
       app.store.listEvents(app.game || 1),
     ]);
@@ -872,7 +1138,10 @@ async function sync({ force = false } = {}) {
 function applySnapshot({ roomRow, game, moveRows, eventRows, restarted }) {
   app.roomRow = roomRow;
   app.game = game;
-  app.board = boardFromRoom(roomRow);
+  // The poll returns only a few columns, so the board is kept from the full
+  // row read when joining; a full row (or a first sync) refreshes it.
+  if (roomRow.board) app.board = boardFromRoom(roomRow);
+  else if (!app.board) app.board = defaultBoard();
   app.host = isHostDevice();
   const previousSide = app.mySide;
   // The seat (host / opponent / spectator) comes from presence; only the side
@@ -886,6 +1155,13 @@ function applySnapshot({ roomRow, game, moveRows, eventRows, restarted }) {
   app.state = state;
   app.moves = rows.slice(0, applied);
   app.events = eventRows;
+  app.outcome = outcomeOf(state, app.events);
+  const last = app.moves[app.moves.length - 1] || null;
+  app.frozenAt = app.outcome.over && last ? Date.parse(last.created_at) || null : null;
+  if (restarted) {
+    app.readyGame = 0;
+    app.timeoutPosted = false;
+  }
   if (error) setError(`同步异常：${error}`);
   else setError('');
   const lastEvent = app.events.length ? app.events[app.events.length - 1] : null;
@@ -911,6 +1187,18 @@ async function submit(x, y) {
   if (app.submitting) return;
   if (app.role === ROLE.SPECTATOR) {
     setNotice('你正在观战：旁观者不能落子。');
+    return;
+  }
+  if (!app.readiness || !app.readiness.live) {
+    setNotice(
+      app.readiness && app.readiness.opponentWaiting
+        ? '还没有对手：等第二位玩家通过邀请链接加入后才能开始。'
+        : '对局尚未开始：等双方都点“准备完毕”并在读秒结束后才能落子。',
+    );
+    return;
+  }
+  if (app.outcome && app.outcome.over) {
+    setNotice('对局已结束，可以由房主开始新一局。');
     return;
   }
   if (state.isGameOver) {
@@ -1034,7 +1322,9 @@ function renderBoard() {
     return;
   }
   const legal = new Set();
-  const interactive = !state.isGameOver && state.sideToMove === app.mySide && !app.submitting;
+  const live = Boolean(app.readiness && app.readiness.live);
+  const over = Boolean(app.outcome && app.outcome.over);
+  const interactive = live && !over && !state.isGameOver && state.sideToMove === app.mySide && !app.submitting;
   for (let index = 0; index < state.cells.length; index += 1) {
     if (interactive && state.cells[index] === Cell.OPEN) legal.add(index);
   }
@@ -1192,6 +1482,9 @@ function askNickname({ required = false, onSaved = null } = {}) {
 }
 
 function syncRoomUI() {
+  // Refresh readiness and the clocks first: the board's interactivity and the
+  // ready/clock widgets all read the values computed here.
+  if (app.phase === 'room' && app.roomRow) updateClockUI();
   renderBoard();
   renderHistory();
   if (app.phase !== 'room') return;
@@ -1211,7 +1504,10 @@ function syncRoomUI() {
         : `${ROLE_LABELS[app.role]} · 我执${sideName(app.mySide)} · 对手执${sideName(otherSide)}`;
 
   if (state) {
-    els.statusLine.textContent = describe(state, app.mySide);
+    els.statusLine.textContent =
+      app.outcome && app.outcome.reason === 'timeout'
+        ? `${sideLabel(app.outcome.loser)} 方超时，${sideLabel(app.outcome.winner)} 方获胜`
+        : describe(state, app.mySide);
     const chipSide = state.isGameOver ? state.winner : state.sideToMove;
     const turnName = state.isGameOver ? '' : nicknameForSide(app.roster, app.roomRow, state.sideToMove);
     els.turnChip.textContent = state.isGameOver
@@ -1224,7 +1520,11 @@ function syncRoomUI() {
     els.turnChip.className = chipSide === null ? 'turn-chip' : `turn-chip chip-${sideLabel(chipSide).toLowerCase()}`;
     els.statMoves.textContent = String(state.moveHistory.length);
     els.statSide.textContent = spectator ? '观战' : sideName(app.mySide);
-    els.statResult.textContent = state.winner !== null ? `${sideLabel(state.winner)} 胜` : state.isDraw ? '和棋' : '进行中';
+    els.statResult.textContent = app.outcome && app.outcome.over
+      ? app.outcome.winner !== null
+        ? `${sideLabel(app.outcome.winner)} 胜`
+        : '和棋'
+      : '进行中';
   } else {
     els.statusLine.textContent = '正在读取房间…';
   }
@@ -1264,11 +1564,34 @@ function syncRoomUI() {
   }
   els.undoStatus.textContent = mine ? '悔棋请求已发出，等待对手回应…' : '';
 
-  const over = Boolean(state && state.isGameOver);
+  const player = app.role === ROLE.HOST || app.role === ROLE.GUEST;
+  const readiness = app.readiness || refreshReadiness();
+  const myReady = app.readyGame >= (app.game || 1);
+  const opponentReady = app.role === ROLE.HOST ? readiness.readyGuest : readiness.readyHost;
+  els.readyButton.classList.toggle('hidden', !joined || !player);
+  els.readyButton.disabled = !joined || !player || (readiness.live && !app.outcome.over);
+  els.readyButton.textContent = myReady ? '取消准备' : '准备完毕';
+  els.readyHint.textContent = !joined || !player
+    ? ''
+    : readiness.opponentWaiting
+      ? '还没有对手：把邀请链接发给朋友，他打开后你们再各自点“准备完毕”。'
+      : readiness.live && !app.outcome.over
+        ? '对局进行中。'
+        : `你：${myReady ? '已准备' : '未准备'} · 对手：${opponentReady ? '已准备' : '未准备'}`;
+
+  const over = Boolean(app.outcome && app.outcome.over);
   els.resultBanner.classList.toggle('hidden', !over);
-  if (over) els.resultText.textContent = describe(state, app.mySide);
+  if (over) {
+    els.resultText.textContent =
+      app.outcome.reason === 'timeout'
+        ? `${sideLabel(app.outcome.loser)} 方超时，${sideLabel(app.outcome.winner)} 方获胜！`
+        : app.outcome.reason === 'draw'
+          ? '和棋：已经没有可落子格'
+          : `${sideLabel(app.outcome.winner)} 方四连获胜！`;
+  }
   els.resultHost.classList.toggle('hidden', !app.host);
   els.resultGuest.classList.toggle('hidden', app.host);
+  updateClockUI();
 }
 
 /** The online-member list, newest heartbeat first within each role. */
@@ -1323,6 +1646,12 @@ function boot() {
   els.modalRoot = qs('#modal-root');
   els.modal = qs('#modal');
   els.openRules = qs('#open-rules');
+  els.clockBar = qs('#clock-bar');
+  els.countdown = qs('#countdown');
+  els.clocks = {
+    [Cell.A]: { node: qs('#clock-a'), name: qs('#clock-name-a'), main: qs('#clock-main-a'), move: qs('#clock-move-a') },
+    [Cell.B]: { node: qs('#clock-b'), name: qs('#clock-name-b'), main: qs('#clock-main-b'), move: qs('#clock-move-b') },
+  };
 
   app.view = new BoardView(qs('#board'), {
     onDown: (x, y, event) => {
@@ -1361,6 +1690,8 @@ function boot() {
   const continueToRoom = () => (params.room ? joinRoom() : undefined);
   if (!app.nickname) askNickname({ required: true, onSaved: continueToRoom });
   else continueToRoom();
+  // The clock ticks locally between polls; no extra network traffic.
+  window.setInterval(updateClockUI, CLOCK_TICK_MS);
   notifyReady();
 }
 

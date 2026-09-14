@@ -16,6 +16,8 @@
 | 在线成员 | 房间成员列表显示昵称、身份（房主 / 对手 / 观战）与在线状态；每约 2 秒心跳一次，超过 15 秒没有心跳视为离线并移出名单 |
 | 旁观模式 | 第一个通过邀请链接进入的人成为对手，之后进入的人自动成为旁观者（数据库层面只允许一个对手座位）；旁观者可以看棋、看成员列表，但不能落子、悔棋或管理房间 |
 | 接替对手 | 对手座位空出来（或对手离线）时，旁观者会出现"接替对手"按钮，点一下即可上座 |
+| 棋钟 | 每方一个局时（默认 10 分钟）和一个步时（默认 90 秒），房主建房时可选；任一方局时用尽或单步超过步时即判负 |
+| 准备与读秒 | 双方都点"准备完毕"后统一读秒 3 秒，随后才开始计时与行棋；对手没进来之前房主无法落子 |
 | 悔棋 | 任意一方可"悔棋"，由对手同意/拒绝后才生效；在自己回合悔棋会撤回双方各一手（回到你上一手之前），刚下完就悔棋只撤回你那一手；对手若直接落子，请求自动失效 |
 | 再来一局 | 对局结束后房主可"再来一局"或"再来一局（交换先后手）"，双方同时重置 |
 | 关闭房间 | 房主可删除房间，房间号随之释放；对手会看到"房间已不存在" |
@@ -40,6 +42,8 @@ create table if not exists public.rooms (
   host_token text not null,
   host_side smallint not null default 2,
   game integer not null default 1,
+  main_ms integer not null default 600000,   -- 局时：每方总时间（毫秒）
+  move_ms integer not null default 90000,    -- 步时：单步上限（毫秒）
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -75,6 +79,8 @@ create table if not exists public.members (
   nickname text not null default '棋友',
   role text not null default 'spectator',   -- host | guest | spectator
   side smallint,                            -- 2=A 方, 3=B 方, 旁观为 null
+  ready_game integer not null default 0,     -- 该设备已为第几局点过"准备完毕"
+  ready_at timestamptz,                      -- 由触发器写入的准备时刻（读秒基准）
   joined_at timestamptz not null default now(),
   last_seen timestamptz not null default now(),
   unique (room, device)
@@ -88,6 +94,9 @@ create unique index if not exists members_room_guest_unique
 create or replace function public.touch_members() returns trigger as $$
 begin
   new.last_seen := now();
+  if tg_op = 'INSERT' or new.ready_game is distinct from old.ready_game then
+    new.ready_at := now();
+  end if;
   return new;
 end $$ language plpgsql;
 
@@ -97,6 +106,10 @@ create trigger members_touch before insert or update on public.members
 
 -- 从旧版（只有 moves，没有 game 列）升级时执行这两行
 alter table public.moves add column if not exists game integer not null default 1;
+alter table public.rooms add column if not exists main_ms integer not null default 600000;
+alter table public.rooms add column if not exists move_ms integer not null default 90000;
+alter table public.members add column if not exists ready_game integer not null default 0;
+alter table public.members add column if not exists ready_at timestamptz;
 alter table public.moves drop constraint if exists moves_room_index_unique;
 alter table public.moves drop constraint if exists moves_room_game_index_unique;
 alter table public.moves add constraint moves_room_game_index_unique unique (room, game, move_index);
@@ -185,6 +198,10 @@ grant usage, select on all sequences in schema public to anon;
 | 为什么后来的人是旁观 | 这是有意的：第一个进入的人成为对手，其余人进入观战，数据库只允许一个对手座位。对手离线或退出后，旁观者会出现"接替对手"按钮 |
 | 昵称怎么改 | 房间内点 **修改昵称**（或初始界面上的同名按钮）即可，改名会同步给房间里所有人 |
 | 成员显示"离线" | 心跳超过 15 秒没更新（关掉标签页、断网、手机锁屏过久等）。重新打开页面或点"立即同步"即可恢复在线 |
+| 棋钟怎么算的 | 每手的时间由数据库时间戳推算：这一手从"上一手落下的时刻"开始计时，双方各自算出同一个剩余时间，所以不会出现两边表不一致 |
+| 超时判负由谁裁决 | 任何一个在线客户端发现超时都会写一条 `clock_timeout` 事件（同一局只写一次），两边据此判定胜负；超时方是"轮到走棋的那一方" |
+| 房主为什么点不动棋盘 | 对手还没进来，或双方还没都点"准备完毕"，或读秒还没结束；侧栏的提示会写明当前差在哪一步 |
+| 同步频率 | 默认每 0.7 秒同步一次（棋钟更准），心跳每约 2 秒一次。轮询只取必要字段（房间轮询不带棋盘 JSON），一轮约几百字节；想更省流量可以调大 `online/online.js` 里的 `POLL_MS`（棋钟显示不受影响，它由时间戳推算） |
 | 房间号已存在 | 换一个房间号；或者让原房主继续用那一间 |
 | 对手看不到变化 | 检查双方"最近同步"时间是否在跳；确认房间号一致（页面自动转大写） |
 | 想彻底重开 | 房主点 **清空房间**（清空该房间所有着法与请求，局号回到 1）；或直接换个房间号 |

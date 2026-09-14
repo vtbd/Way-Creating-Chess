@@ -24,6 +24,84 @@
   gap: 10px;
 }
 
+.board-frame {
+  position: relative;
+}
+
+.clock-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.clock-side {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--panel-soft);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 8px 14px;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.clock-side.is-turn {
+  border-color: var(--highlight);
+  box-shadow: 0 0 0 1px rgba(255, 224, 119, 0.35);
+}
+
+.clock-name {
+  font-size: 0.8rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.clock-main {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 1.7rem;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+}
+
+.clock-side.is-turn .clock-main {
+  color: var(--highlight);
+}
+
+.clock-main.is-low {
+  color: #f0908a;
+}
+
+.clock-move {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.clock-vs {
+  color: var(--muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.countdown {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius);
+  background: rgba(12, 15, 20, 0.45);
+  color: var(--highlight);
+  font-size: clamp(56px, 16vw, 160px);
+  font-weight: 800;
+  text-shadow: 0 10px 34px rgba(0, 0, 0, 0.65);
+  pointer-events: none;
+}
+
 .link-button {
   display: inline-flex;
   align-items: center;

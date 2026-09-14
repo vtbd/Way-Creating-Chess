@@ -51,12 +51,27 @@ export function createSupabaseStore({ url, key, room, fetchImpl = globalThis.fet
       return Array.isArray(rows) && rows.length ? rows[0] : null;
     },
 
-    async createRoom({ board, hostToken, hostSide }) {
+    /**
+     * The fields the poll actually needs. Leaving the board JSON and the host
+     * token out keeps each poll small — important with a 0.7 s interval on the
+     * free tier.
+     */
+    async getRoomState() {
+      const response = await fetchImpl(
+        `${rooms}?code=eq.${encodeURIComponent(code)}&select=code,game,host_side,main_ms,move_ms`,
+        { headers },
+      );
+      if (!response.ok) throw new Error(`读取房间失败：HTTP ${response.status}${await detail(response)}`);
+      const rows = await response.json();
+      return Array.isArray(rows) && rows.length ? rows[0] : null;
+    },
+
+    async createRoom({ board, hostToken, hostSide, mainMs, moveMs }) {
       const response = await fetchImpl(rooms, {
         method: 'POST',
         headers: { ...headers, Prefer: 'return=minimal' },
         body: JSON.stringify([
-          { code, board, host_token: hostToken, host_side: hostSide, game: 1 },
+          { code, board, host_token: hostToken, host_side: hostSide, game: 1, main_ms: mainMs, move_ms: moveMs },
         ]),
       });
       if (response.ok) return { ok: true };
@@ -76,7 +91,7 @@ export function createSupabaseStore({ url, key, room, fetchImpl = globalThis.fet
 
     async listMoves(game) {
       const response = await fetchImpl(
-        `${moves}?${roomFilter}&game=eq.${Number(game)}&select=move_index,side,x,y&order=move_index.asc`,
+        `${moves}?${roomFilter}&game=eq.${Number(game)}&select=move_index,side,x,y,created_at&order=move_index.asc`,
         { headers },
       );
       if (!response.ok) throw new Error(`读取着法失败：HTTP ${response.status}${await detail(response)}`);
@@ -152,7 +167,7 @@ export function createSupabaseStore({ url, key, room, fetchImpl = globalThis.fet
      */
     async listMembers() {
       const response = await fetchImpl(
-        `${members}?${roomFilter}&select=device,nickname,role,side,joined_at,last_seen&order=joined_at.asc`,
+        `${members}?${roomFilter}&select=device,nickname,role,side,joined_at,last_seen,ready_game,ready_at&order=joined_at.asc`,
         { headers },
       );
       if (!response.ok) throw new Error(`读取房间成员失败：HTTP ${response.status}${await detail(response)}`);
@@ -165,11 +180,11 @@ export function createSupabaseStore({ url, key, room, fetchImpl = globalThis.fet
      * Create or refresh this device's member row (heartbeat + rename + seat).
      * `last_seen` is stamped by a database trigger, so all devices agree on it.
      */
-    async heartbeat({ device, nickname, role, side = null }) {
+    async heartbeat({ device, nickname, role, side = null, readyGame = 0 }) {
       const response = await fetchImpl(`${members}?on_conflict=room,device`, {
         method: 'POST',
         headers: { ...headers, Prefer: 'resolution=merge-duplicates,return=minimal' },
-        body: JSON.stringify([{ room: code, device, nickname, role, side }]),
+        body: JSON.stringify([{ room: code, device, nickname, role, side, ready_game: readyGame }]),
       });
       if (response.ok) return { ok: true };
       if (response.status === 409) return { ok: false, conflict: true, reason: '对手座位已经被占用' };

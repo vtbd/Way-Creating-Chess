@@ -27,7 +27,17 @@ export const EVENT = {
   UNDO_REQUEST: 'undo_request',
   UNDO_DONE: 'undo_done',
   UNDO_DECLINED: 'undo_declined',
+  CLOCK_TIMEOUT: 'clock_timeout',
 };
+
+/** Chess clock defaults: 10 minutes of main time and 90 s per move. */
+export const CLOCK_DEFAULTS = { mainMs: 10 * 60 * 1000, moveMs: 90 * 1000 };
+export const CLOCK_LIMITS = {
+  mainMs: { min: 60 * 1000, max: 120 * 60 * 1000 },
+  moveMs: { min: 10 * 1000, max: 10 * 60 * 1000 },
+};
+/** Both players ready -> a short countdown, then the clocks start running. */
+export const COUNTDOWN_MS = 3000;
 
 /** Roles inside a room. Only the host and the guest play; everyone else watches. */
 export const ROLE = { HOST: 'host', GUEST: 'guest', SPECTATOR: 'spectator' };
@@ -143,6 +153,125 @@ export function nicknameForSide(members, room, side) {
   return member ? member.nickname : '';
 }
 
+/* ----------------------------------------------------------------- clock */
+
+export function clockSettings(room) {
+  const mainMs = Number(room && room.main_ms);
+  const moveMs = Number(room && room.move_ms);
+  return {
+    mainMs: Number.isFinite(mainMs) && mainMs > 0 ? mainMs : CLOCK_DEFAULTS.mainMs,
+    moveMs: Number.isFinite(moveMs) && moveMs > 0 ? moveMs : CLOCK_DEFAULTS.moveMs,
+  };
+}
+
+/** `mm:ss` (or `h:mm:ss` for long games). */
+export function formatClock(ms) {
+  const total = Math.max(0, Math.round(Number(ms) || 0));
+  const seconds = Math.floor(total / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  const pad = (value) => String(value).padStart(2, '0');
+  if (minutes >= 60) return `${Math.floor(minutes / 60)}:${pad(minutes % 60)}:${pad(rest)}`;
+  return `${minutes}:${pad(rest)}`;
+}
+
+export function formatStep(ms) {
+  return `${Math.round(Number(ms) / 1000)} 秒`;
+}
+
+/**
+ * Readiness for a specific game.
+ *
+ * A member is ready when their `ready_game` is at least the current game
+ * number, which also means a rematch (game + 1) automatically clears both
+ * ready flags. `ready_at` is stamped by the database, so every client derives
+ * the same start time and the same countdown.
+ */
+export function readinessFor({ members, serverTimeMs, game }) {
+  const active = activeMembers(members, serverTimeMs);
+  const host = active.find((member) => member.role === ROLE.HOST) || null;
+  const guest = active.find((member) => member.role === ROLE.GUEST) || null;
+  const readyHost = Boolean(host && Number(host.ready_game) >= game);
+  const readyGuest = Boolean(guest && Number(guest.ready_game) >= game);
+  const bothReady = readyHost && readyGuest;
+  const startAt = bothReady
+    ? Math.max(Date.parse(host.ready_at) || 0, Date.parse(guest.ready_at) || 0)
+    : null;
+  const liveAt = startAt === null ? null : startAt + COUNTDOWN_MS;
+  const countdownLeft = liveAt === null ? 0 : Math.max(0, liveAt - serverTimeMs);
+  return {
+    host,
+    guest,
+    readyHost,
+    readyGuest,
+    bothReady,
+    opponentWaiting: !guest,
+    startAt,
+    liveAt,
+    live: liveAt !== null && serverTimeMs >= liveAt,
+    countdownLeft,
+  };
+}
+
+/**
+ * Derive both clocks from the shared timestamps.
+ *
+ * Each turn starts when the previous stone appeared in the database, so the
+ * two devices always compute the same remaining main time and step time.
+ *
+ * @param {object} options
+ * @param {number|null} options.startAt game start (ms, database clock)
+ * @param {number|null} options.frozenAt stop the clock here (game over)
+ */
+export function clockState({ moves, room, startAt, serverTimeMs, frozenAt = null }) {
+  const { mainMs, moveMs } = clockSettings(room);
+  const list = sortMoves(moves);
+  const spent = { [Cell.A]: 0, [Cell.B]: 0 };
+  let turnStart = startAt === null || startAt === undefined ? null : startAt + COUNTDOWN_MS;
+  let side = Cell.A;
+  for (const move of list) {
+    const at = Date.parse(move.created_at);
+    if (Number.isFinite(at)) {
+      if (turnStart !== null) spent[side] += Math.max(0, at - turnStart);
+      turnStart = at;
+      side = otherSide(side);
+    }
+  }
+  const now = frozenAt !== null && frozenAt !== undefined ? frozenAt : serverTimeMs;
+  const running = Number.isFinite(now) && turnStart !== null;
+  const currentElapsed = running ? Math.max(0, now - turnStart) : 0;
+  const turnSpent = currentElapsed;
+  const remaining = {
+    [Cell.A]: mainMs - spent[Cell.A] - (side === Cell.A ? turnSpent : 0),
+    [Cell.B]: mainMs - spent[Cell.B] - (side === Cell.B ? turnSpent : 0),
+  };
+  return {
+    mainMs,
+    moveMs,
+    sideToMove: side,
+    turnStart,
+    currentElapsed,
+    stepRemaining: Math.max(0, moveMs - currentElapsed),
+    remaining,
+    running,
+  };
+}
+
+/** The side that has just run out of main time or step time, if any. */
+export function clockTimeout(clock, { live }) {
+  if (!live || !clock || !clock.running) return null;
+  if (clock.stepRemaining <= 0) return clock.sideToMove;
+  if (clock.remaining[clock.sideToMove] <= 0) return clock.sideToMove;
+  return null;
+}
+
+/** The clock that already expired in this game, taken from the event log. */
+export function recordedTimeout(events) {
+  const found = sortEvents(events).find((event) => event.kind === EVENT.CLOCK_TIMEOUT);
+  if (!found) return null;
+  return Number(found.side);
+}
+
 export function boardFromRoom(room) {
   const raw = room && room.board;
   const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -159,6 +288,8 @@ export function boardSummary(board) {
 export function sortMoves(list) {
   return (list || [])
     .map((row) => ({
+      // Keep extra fields (notably the database `created_at` the clocks need).
+      ...row,
       move_index: Number(row.move_index),
       side: Number(row.side),
       x: Number(row.x),

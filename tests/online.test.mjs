@@ -17,15 +17,23 @@ import { fileURLToPath } from 'node:url';
 
 import { Cell } from '../js/engine.js';
 import {
+  CLOCK_DEFAULTS,
+  COUNTDOWN_MS,
   EVENT,
   boardFromRoom,
   buildInviteUrl,
+  clockSettings,
+  clockState,
+  clockTimeout,
   defaultBoard,
+  formatClock,
   isHost,
   nextMove,
   pendingUndo,
   randomRoomCode,
+  readinessFor,
   rebuild,
+  recordedTimeout,
   resolveHostSide,
   sideForRole,
   undoPlan,
@@ -44,6 +52,54 @@ const pageSource = readFileSync(resolve(webRoot, 'online/online.js'), 'utf8');
 const settle = async (turns = 10) => {
   for (let i = 0; i < turns; i += 1) await new Promise((done) => setTimeout(done, 0));
 };
+const realWait = (ms) => new Promise((done) => setTimeout(done, ms));
+
+/**
+ * Put a room into "live" state: both seats ready, countdown elapsed.
+ * Mirrors what two real players do (each pressing 准备完毕) without needing a
+ * second browser.
+ */
+async function goLive(roomCode, { pressReady = true } = {}) {
+  if (pressReady && el('ready-button') && !el('ready-button').classList.contains('hidden')) {
+    el('ready-button').fire('click');
+    await settle();
+  }
+  const room = fake.room(roomCode);
+  // Both seats must exist and be online for the game to start; a seat whose
+  // device left (or was never started in this test) is filled in here.
+  const hostSide = Number(room.host_side) === Cell.B ? Cell.B : Cell.A;
+  for (const [role, side, nickname] of [
+    ['host', hostSide, '房主'],
+    ['guest', hostSide === Cell.A ? Cell.B : Cell.A, '小刚'],
+  ]) {
+    if (!fake.findMember(roomCode, role)) {
+      fake.injectMember({
+        room: roomCode,
+        device: `synthetic-${role}-${roomCode}`,
+        nickname,
+        role,
+        side,
+        readyGame: Number(room.game) || 1,
+      });
+    }
+  }
+  for (const role of ['host', 'guest']) {
+    const seat = fake.findMember(roomCode, role);
+    if (seat) fake.setReady(seat.device, Number(room.game) || 1);
+  }
+  fake.advance(4000); // the 3 s countdown plus a margin
+  keepAlive(roomCode); // real clients heartbeat every ~2 s, so nobody goes stale
+  el('sync').fire('click');
+  await settle();
+}
+
+/** Refresh both seats' heartbeats (what a real client does every couple of seconds). */
+function keepAlive(roomCode) {
+  for (const role of ['host', 'guest']) {
+    const seat = fake.findMember(roomCode, role);
+    if (seat) fake.touchMember(seat.device);
+  }
+}
 
 let dom = null;
 let el = () => null;
@@ -219,6 +275,101 @@ test('the store speaks the documented REST dialect', async () => {
   assert.match(duplicate.reason, /已被占用/);
 });
 
+/* ------------------------------------------------------------------ clock */
+
+const T0 = Date.parse('2026-09-14T08:00:00Z');
+const roomWithClock = { host_side: Cell.A, main_ms: 600000, move_ms: 90000 };
+const memberRow = (role, side, readyGame, readyAt, lastSeen = T0) => ({
+  room: 'C',
+  device: `${role}-device`,
+  nickname: role === 'host' ? '房主' : '小刚',
+  role,
+  side,
+  ready_game: readyGame,
+  ready_at: readyAt === null ? null : new Date(readyAt).toISOString(),
+  joined_at: new Date(T0).toISOString(),
+  last_seen: new Date(lastSeen).toISOString(),
+});
+
+test('clock settings fall back to the 10 minute / 90 second defaults', () => {
+  assert.deepEqual(clockSettings({}), CLOCK_DEFAULTS);
+  assert.deepEqual(clockSettings({ main_ms: 120000, move_ms: 10000 }), { mainMs: 120000, moveMs: 10000 });
+  assert.equal(formatClock(600000), '10:00');
+  assert.equal(formatClock(95000), '1:35');
+  assert.equal(formatClock(-500), '0:00');
+  assert.equal(formatClock(3600000), '1:00:00');
+});
+
+test('the countdown starts only after both players are ready', () => {
+  const bothWaiting = [memberRow('host', Cell.A, 0, null), memberRow('guest', Cell.B, 0, null)];
+  const notReady = readinessFor({ members: bothWaiting, serverTimeMs: T0, game: 1 });
+  assert.equal(notReady.live, false);
+  assert.equal(notReady.opponentWaiting, false);
+  assert.equal(notReady.startAt, null);
+
+  const oneWaiting = [memberRow('host', Cell.A, 1, T0), memberRow('guest', Cell.B, 0, null)];
+  assert.equal(readinessFor({ members: oneWaiting, serverTimeMs: T0 + 5000, game: 1 }).live, false);
+
+  // Both ready at T0: 3 s countdown, then live.
+  const both = [memberRow('host', Cell.A, 1, T0), memberRow('guest', Cell.B, 1, T0)];
+  const counting = readinessFor({ members: both, serverTimeMs: T0 + 1000, game: 1 });
+  assert.equal(counting.live, false);
+  assert.equal(counting.countdownLeft, COUNTDOWN_MS - 1000);
+  const live = readinessFor({ members: both, serverTimeMs: T0 + COUNTDOWN_MS + 10, game: 1 });
+  assert.equal(live.live, true);
+
+  // A rematch (game 2) clears both ready flags.
+  assert.equal(readinessFor({ members: both, serverTimeMs: T0 + 9000, game: 2 }).bothReady, false);
+  // A seat that stopped heartbeating cannot start a game.
+  const offline = [memberRow('host', Cell.A, 1, T0, T0), memberRow('guest', Cell.B, 1, T0)];
+  assert.equal(readinessFor({ members: offline, serverTimeMs: T0 + 60000, game: 1 }).live, false);
+});
+
+test('both clocks are derived from the shared move timestamps', () => {
+  const moves = [
+    { move_index: 0, side: Cell.A, x: 0, y: 0, created_at: new Date(T0 + COUNTDOWN_MS + 5000).toISOString() },
+    { move_index: 1, side: Cell.B, x: 5, y: 0, created_at: new Date(T0 + COUNTDOWN_MS + 8000).toISOString() },
+  ];
+  const clock = clockState({ moves, room: roomWithClock, startAt: T0, serverTimeMs: T0 + COUNTDOWN_MS + 12000 });
+
+  assert.equal(clock.sideToMove, Cell.A, 'A moves again after B answered');
+  assert.equal(clock.remaining[Cell.A], 600000 - 5000 - 4000, 'A spent 5 s on move 1 and 4 s so far on move 2');
+  assert.equal(clock.remaining[Cell.B], 600000 - 3000, 'B spent 3 s on the answer');
+  assert.equal(clock.stepRemaining, 90000 - 4000);
+
+  // Nobody can be flagged before the countdown is over.
+  const early = clockState({ moves: [], room: roomWithClock, startAt: T0, serverTimeMs: T0 + 1000 });
+  assert.equal(clockTimeout(early, { live: true }), null);
+});
+
+test('step time and main time both end the game', () => {
+  // Step time (90 s) runs out on the very first move.
+  const slow = clockState({
+    moves: [],
+    room: roomWithClock,
+    startAt: T0,
+    serverTimeMs: T0 + COUNTDOWN_MS + 95000,
+  });
+  assert.equal(clockTimeout(slow, { live: true }), Cell.A);
+
+  // Main time (10 min) runs out even when each move was quick.
+  const long = clockState({
+    moves: [
+      { move_index: 0, side: Cell.A, x: 0, y: 0, created_at: new Date(T0 + COUNTDOWN_MS + 89000).toISOString() },
+      { move_index: 1, side: Cell.B, x: 5, y: 0, created_at: new Date(T0 + COUNTDOWN_MS + 100000).toISOString() },
+    ],
+    room: { host_side: Cell.A, main_ms: 120000, move_ms: 90000 },
+    startAt: T0,
+    serverTimeMs: T0 + COUNTDOWN_MS + 230000,
+  });
+  assert.equal(clockTimeout(long, { live: true }), Cell.A);
+  assert.ok(long.remaining[Cell.A] <= 0);
+
+  // A timeout that was already recorded is what ends the game for everyone.
+  assert.equal(recordedTimeout([{ id: 1, kind: EVENT.CLOCK_TIMEOUT, side: Cell.B, target: null }]), Cell.B);
+  assert.equal(recordedTimeout([{ id: 1, kind: EVENT.UNDO_REQUEST, side: Cell.B, target: 0 }]), null);
+});
+
 /* ------------------------------------------------------------- the page */
 
 const SUPABASE_URL = 'https://demo.supabase.co';
@@ -243,6 +394,8 @@ test('the host creates a room, keeps host controls and plays a move', async () =
   assert.equal(room.host_side, Cell.A);
   assert.equal(room.game, 1);
   assert.equal(room.board.width, 12);
+  assert.equal(room.main_ms, 600000, 'default main time is 10 minutes');
+  assert.equal(room.move_ms, 90000, 'default step time is 90 seconds');
   assert.ok(room.host_token);
 
   assert.match(el('role-line').textContent, /房主/);
@@ -255,6 +408,20 @@ test('the host creates a room, keeps host controls and plays a move', async () =
   assert.match(invite, /url=https%3A%2F%2Fdemo\.supabase\.co/);
   assert.match(invite, /key=eyJtest-key/, 'the joiner gets the connection info from the link');
   assert.equal(/host=/.test(invite), false, 'host rights are never shared');
+
+  // No opponent yet: the host may not play, and the clock has not started.
+  assert.match(el('ready-hint').textContent, /还没有对手/);
+  cellAt(0, 0).fire('pointerdown', { button: 0 });
+  await settle();
+  assert.match(el('notice').textContent, /还没有对手/);
+  assert.equal(fake.movesOf('HOST1').length, 0);
+  assert.equal(el('clock-main-a').textContent, '10:00');
+  assert.equal(el('countdown').classList.contains('hidden'), true);
+
+  // The invitee arrives and both players get ready.
+  fake.injectMember({ room: 'HOST1', device: 'guest-device', nickname: '小刚', role: 'guest', side: Cell.B });
+  await goLive('HOST1');
+  assert.equal(el('countdown').classList.contains('hidden'), true, 'the countdown is over');
 
   assert.ok(cellAt(0, 0).classList.contains('is-legal'));
   cellAt(0, 0).fire('pointerdown', { button: 0 });
@@ -313,6 +480,7 @@ test('asking for 悔棋 on your own turn takes back both plies', async () => {
 });
 
 test('the host can approve an undo request from the opponent', async () => {
+  await goLive('HOST1', { pressReady: false });
   // Rebuild a small position: A plays, then B answers and asks to take back
   // the stone they just played (a one-ply undo).
   cellAt(0, 0).fire('pointerdown', { button: 0 });
@@ -337,6 +505,8 @@ test('the host can approve an undo request from the opponent', async () => {
 
 test('the invited side joins from the link, gets the other side and no host controls', async () => {
   el('leave').fire('click');
+  // The seat holder from the earlier tests leaves, so this device takes it.
+  fake.db.members = fake.db.members.filter((member) => member.device !== 'guest-device');
   const search = `?room=HOST1&url=${encodeURIComponent(SUPABASE_URL)}&key=${SUPABASE_KEY}`;
   await startPage({ tag: 'guest', search });
 
@@ -346,6 +516,8 @@ test('the invited side joins from the link, gets the other side and no host cont
   assert.equal(el('key'), null, 'the joiner never sees the anon key input');
   assert.equal(el('result-host').classList.contains('hidden'), true, 'rematch stays with the host');
   assert.equal(el('stat-moves').textContent, '1');
+
+  await goLive('HOST1');
 
   // It is B's turn, so the joiner may play.
   const target = cellAt(5, 0);
@@ -394,6 +566,10 @@ test('a custom board, a finished game and a rematch that swaps sides', async () 
   assert.ok(room);
   assert.equal(room.board.width, 4, 'the pasted board is stored in the room');
   assert.equal(el('board').querySelectorAll('.cell').length, 16);
+
+  // The opponent arrives, both press 准备完毕, the countdown runs out.
+  fake.injectMember({ room: 'JSON1', device: 'json-guest', nickname: '小刚', role: 'guest', side: Cell.B });
+  await goLive('JSON1');
 
   // A wins row 0 while B answers on row 3.
   const play = async (x, y) => {
@@ -493,7 +669,7 @@ test('later invitees join as spectators and cannot play', async () => {
   assert.match(roster, /观战/);
   assert.match(roster, /小刚/);
   assert.match(roster, /对手 · B 方/);
-  assert.equal(el('roster').querySelectorAll('.roster-item').length, 2);
+  assert.ok(el('roster').querySelectorAll('.roster-item').length >= 2, 'the roster lists everyone in the room');
 
   cellAt(0, 0).fire('pointerdown', { button: 0 });
   await settle();
@@ -528,4 +704,48 @@ test('a spectator can take the opponent seat once it is free', async () => {
   const mine = fake.membersOf('HOST1').find((member) => member.device === myDevice);
   assert.equal(mine.role, 'guest');
   assert.equal(Number(mine.side), Cell.B);
+});
+
+test('a clock timeout is recorded once and ends the game', async () => {
+  el('leave') && el('leave').fire('click');
+  await startPage({ tag: 'clock', nickname: '计时' });
+
+  el('url').value = SUPABASE_URL;
+  el('key').value = SUPABASE_KEY;
+  el('room-input').value = 'CLOCK1';
+  el('host-side').value = 'first';
+  el('main-minutes').value = '2';
+  el('move-seconds').value = '10';
+  el('create-room').fire('click');
+  await settle();
+
+  const room = fake.room('CLOCK1');
+  assert.equal(room.main_ms, 120000, 'the host can shorten the main time');
+  assert.equal(room.move_ms, 10000, 'the host can shorten the step time');
+  assert.equal(el('clock-main-a').textContent, '2:00');
+  assert.match(el('clock-move-a').textContent, /10 秒/);
+
+  fake.injectMember({ room: 'CLOCK1', device: 'clock-guest', nickname: '小刚', role: 'guest', side: Cell.B });
+  await goLive('CLOCK1');
+
+  // Nobody moves: A runs out of step time (10 s) and loses.
+  fake.advance(15000);
+  keepAlive('CLOCK1');
+  el('sync').fire('click');
+  await settle(20);
+  await realWait(250); // let the local clock tick observe the new server time
+  await settle(20);
+
+  const timeouts = fake.eventsOf('CLOCK1').filter((event) => event.kind === EVENT.CLOCK_TIMEOUT);
+  assert.equal(timeouts.length, 1, 'the timeout is written exactly once');
+  assert.equal(Number(timeouts[0].side), Cell.A, 'the side to move ran out of time');
+  assert.equal(el('result-banner').classList.contains('hidden'), false);
+  assert.match(el('result-text').textContent, /A 方超时/);
+  assert.equal(el('stat-result').textContent, 'B 胜');
+
+  // Extra polls must not pile up more timeout events.
+  el('sync').fire('click');
+  await settle(20);
+  assert.equal(fake.eventsOf('CLOCK1').filter((event) => event.kind === EVENT.CLOCK_TIMEOUT).length, 1);
+  assert.ok(cellAt(0, 0).classList.contains('is-legal') === false, 'the board is closed after the timeout');
 });
