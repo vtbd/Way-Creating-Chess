@@ -19,20 +19,25 @@ import { drawMiniBoard } from '../js/preview.js';
 import { GAME_RULES, ONLINE_CONTROLS, renderRuleSections } from '../js/rules.js';
 import {
   EVENT,
+  ROLE,
+  ROLE_LABELS,
   SIDE_CHOICES,
   SIDE_CHOICE_LABELS,
+  activeMembers,
   boardFromRoom,
   boardSummary,
   buildInviteUrl,
   defaultBoard,
   describe,
   isHost,
+  nicknameForSide,
   pendingUndo,
   randomRoomCode,
   randomToken,
   rebuild,
   resolveHostSide,
-  sideForRole,
+  roleFor,
+  sideForRoleName,
   sideLabel,
   sideName,
   undoPlan,
@@ -41,7 +46,11 @@ import { createSupabaseStore } from './transports.js';
 
 const CONFIG_KEY = 'wcc.online.config.v2';
 const HOST_KEY = (room) => `wcc.online.host.${room}`;
+const DEVICE_KEY = 'wcc.online.device.v1';
+const NICKNAME_KEY = 'wcc.online.nickname.v1';
 const POLL_MS = 1200;
+/** Presence heartbeat interval (multiples of the poll). */
+const HEARTBEAT_EVERY = 2;
 
 const app = {
   phase: 'setup',
@@ -49,6 +58,17 @@ const app = {
   key: '',
   room: '',
   urlToken: '',
+  device: '',
+  nickname: '',
+  role: null,
+  members: [],
+  serverTime: 0,
+  meRow: null,
+  roster: [],
+  seenDevices: new Set(),
+  lastNames: new Map(),
+  presenceReady: false,
+  pollCount: 0,
   store: null,
   roomRow: null,
   board: null,
@@ -127,6 +147,29 @@ function saveHostToken(room, token) {
   writeStorage(HOST_KEY(room), token);
 }
 
+/** Every device gets a private id so the room can tell who is who. */
+function loadDevice() {
+  const stored = readStorage(DEVICE_KEY);
+  if (stored) return stored;
+  const device = randomToken(20);
+  writeStorage(DEVICE_KEY, device);
+  return device;
+}
+
+function loadNickname() {
+  return (readStorage(NICKNAME_KEY) || '').trim();
+}
+
+function saveNickname(nickname) {
+  app.nickname = nickname.trim().slice(0, 12);
+  writeStorage(NICKNAME_KEY, app.nickname);
+  return app.nickname;
+}
+
+function suggestedNickname() {
+  return `棋友${randomRoomCode(3)}`;
+}
+
 function readParams() {
   const params = new URLSearchParams(window.location.search || '');
   return {
@@ -167,6 +210,119 @@ function inviteUrl() {
 
 function storeOptions() {
   return { url: app.url, key: app.key, room: app.room };
+}
+
+/* -------------------------------------------------------------- presence */
+
+const ROLE_ORDER = { [ROLE.HOST]: 0, [ROLE.GUEST]: 1, [ROLE.SPECTATOR]: 2 };
+
+function isHostDevice() {
+  return isHost({ room: app.roomRow, storedToken: loadHostToken(), urlToken: app.urlToken });
+}
+
+/**
+ * Heartbeat this device, pick a seat and refresh the online list.
+ *
+ * The database keeps a single opponent seat, so a second invited device is
+ * automatically pushed to "spectator" instead of both of them believing they
+ * are the opponent.
+ */
+async function refreshPresence({ force = false } = {}) {
+  if (!app.store || !app.roomRow) return;
+  if (!force && app.pollCount % HEARTBEAT_EVERY !== 0) return;
+
+  const host = isHostDevice();
+  let role = roleFor({
+    room: app.roomRow,
+    members: app.members,
+    device: app.device,
+    serverTimeMs: app.serverTime || Date.now(),
+    isHostDevice: host,
+  });
+  let side = sideForRoleName(app.roomRow, role);
+  let result = await app.store.heartbeat({ device: app.device, nickname: app.nickname, role, side });
+  if (!result.ok && result.conflict) {
+    role = ROLE.SPECTATOR;
+    side = null;
+    result = await app.store.heartbeat({ device: app.device, nickname: app.nickname, role, side });
+  }
+  if (!result.ok) {
+    setError(result.reason);
+    return;
+  }
+
+  const { members, serverTime } = await app.store.listMembers();
+  applyRoster({ members, serverTime, role, side });
+}
+
+function applyRoster({ members, serverTime, role, side }) {
+  app.members = members;
+  app.serverTime = serverTime;
+  app.role = role;
+  app.mySide = side;
+  const self = {
+    device: app.device,
+    nickname: app.nickname,
+    role,
+    side,
+    joined_at: (app.meRow && app.meRow.joined_at) || new Date(serverTime).toISOString(),
+    last_seen: new Date(serverTime).toISOString(),
+  };
+  app.meRow = self;
+  app.roster = activeMembers([...members.filter((member) => member.device !== app.device), self], serverTime).sort(
+    (a, b) => ROLE_ORDER[a.role] - ROLE_ORDER[b.role] || Date.parse(a.joined_at) - Date.parse(b.joined_at),
+  );
+  for (const member of app.roster) app.lastNames.set(member.device, member.nickname);
+  announcePresenceChanges();
+}
+
+/** Tell the table when somebody joins or leaves. */
+function announcePresenceChanges() {
+  const current = new Map(app.roster.map((member) => [member.device, member]));
+  if (!app.presenceReady) {
+    app.seenDevices = new Set(current.keys());
+    app.presenceReady = true;
+    const others = app.roster.filter((member) => member.device !== app.device);
+    if (others.length) setNotice(`房间里还有 ${others.length} 位成员（${others.map((m) => m.nickname).join('、')}）。`);
+    return;
+  }
+  for (const [device, member] of current) {
+    if (app.seenDevices.has(device)) continue;
+    setNotice(
+      member.role === ROLE.SPECTATOR
+        ? `${member.nickname} 进入观战`
+        : `${member.nickname} 加入了房间（${ROLE_LABELS[member.role]}）`,
+    );
+  }
+  for (const device of app.seenDevices) {
+    if (current.has(device)) continue;
+    setNotice(`${app.lastNames.get(device) || '有成员'} 离开了房间`);
+  }
+  app.seenDevices = new Set(current.keys());
+}
+
+/** A spectator can take the opponent seat once it is free (or its holder stale). */
+async function takeSeat() {
+  if (!app.store || app.role !== ROLE.SPECTATOR) return;
+  const active = activeMembers(app.members, app.serverTime || Date.now());
+  const busy = active.find((member) => member.role === ROLE.GUEST && member.device !== app.device);
+  if (busy) {
+    setNotice(`${busy.nickname} 正在对局中，暂时不能接替。`);
+    return;
+  }
+  const stale = app.members.find((member) => member.role === ROLE.GUEST && member.device !== app.device);
+  if (stale) await app.store.dropMember(stale.device);
+
+  const side = sideForRoleName(app.roomRow, ROLE.GUEST);
+  const result = await app.store.heartbeat({ device: app.device, nickname: app.nickname, role: ROLE.GUEST, side });
+  if (!result.ok) {
+    await app.store.heartbeat({ device: app.device, nickname: app.nickname, role: ROLE.SPECTATOR, side: null });
+    setNotice('对手座位刚被其他人坐上，你继续观战。');
+  } else {
+    setNotice(`已接替对手，你执${sideName(side)}。`);
+  }
+  await refreshPresence({ force: true });
+  await sync({ force: true });
 }
 
 /* ---------------------------------------------------------- setup screen */
@@ -256,6 +412,8 @@ function renderSetup() {
     'section',
     { class: 'card' },
     h('h2', { text: '创建 / 加入房间' }),
+    h('p', { id: 'setup-nickname', class: 'hint' }),
+    h('div', { class: 'row-gap' }, h('button', { id: 'change-nickname', type: 'button' }, '修改昵称')),
     details,
     h('h3', { text: '创建房间（房主）' }),
     h('label', { class: 'field' }, h('span', { text: '初始棋盘' }), boardSource),
@@ -291,9 +449,13 @@ function renderSetup() {
   els.roomInput = roomInput;
   els.createRoom = sidebarCards.querySelector('#create-room');
   els.joinRoom = sidebarCards.querySelector('#join-room');
+  els.setupNickname = sidebarCards.querySelector('#setup-nickname');
+  els.changeNickname = sidebarCards.querySelector('#change-nickname');
   els.previewCanvas = previewCanvas;
   els.previewInfo = previewInfo;
 
+  els.setupNickname.textContent = `当前昵称：${app.nickname || '（未设置）'}`;
+  els.changeNickname.addEventListener('click', () => askNickname());
   els.boardSource.addEventListener('change', () => {
     els.randomFields.classList.toggle('hidden', els.boardSource.value !== 'random');
     els.jsonField.classList.toggle('hidden', els.boardSource.value !== 'json');
@@ -393,6 +555,7 @@ function renderRoom() {
     { class: 'card' },
     h('h2', { id: 'room-title' }),
     roleLine,
+    h('p', { id: 'room-nickname', class: 'hint' }),
     turnChip,
     statusLine,
     stats,
@@ -403,8 +566,20 @@ function renderRoom() {
       'div',
       { class: 'row-gap' },
       h('button', { id: 'sync', type: 'button' }, '立即同步'),
+      h('button', { id: 'change-nickname-room', type: 'button' }, '修改昵称'),
       h('button', { id: 'leave', type: 'button' }, '退出房间'),
     ),
+  );
+
+  const rosterList = h('ul', { id: 'roster', class: 'roster' });
+  const takeSeatButton = h('button', { id: 'take-seat', class: 'action-button wide hidden', type: 'button' }, '接替对手');
+  const membersCard = h(
+    'section',
+    { class: 'card' },
+    h('h2', { text: '房间成员' }),
+    rosterList,
+    takeSeatButton,
+    h('p', { class: 'hint', text: '成员每约 2 秒发送一次心跳；超过 15 秒没有心跳会显示为离线并暂时离开名单。' }),
   );
 
   const undoRequest = h('button', { id: 'undo-request', class: 'action-button wide', type: 'button' }, '悔棋');
@@ -451,6 +626,7 @@ function renderRoom() {
   const invite = h('input', { id: 'invite', class: 'text-input', type: 'text', readonly: true });
   sidebar.append(
     roomCard,
+    membersCard,
     actionsCard,
     h(
       'section',
@@ -479,6 +655,7 @@ function renderRoom() {
     statSide: roomCard.querySelector('#stat-side'),
     statResult: roomCard.querySelector('#stat-result'),
     roomTitle: roomCard.querySelector('#room-title'),
+    roomNickname: roomCard.querySelector('#room-nickname'),
     historyList,
     undoRequest,
     undoPrompt,
@@ -487,11 +664,15 @@ function renderRoom() {
     undoHint,
     clearRoom,
     closeRoom,
+    rosterList,
+    takeSeatButton,
     invite,
   });
 
   roomCard.querySelector('#sync').addEventListener('click', () => sync({ force: true }));
   roomCard.querySelector('#leave').addEventListener('click', leaveRoom);
+  roomCard.querySelector('#change-nickname-room').addEventListener('click', () => askNickname());
+  takeSeatButton.addEventListener('click', takeSeat);
   undoRequest.addEventListener('click', requestUndo);
   undoPrompt.querySelector('#undo-accept').addEventListener('click', () => answerUndo(true));
   undoPrompt.querySelector('#undo-decline').addEventListener('click', () => answerUndo(false));
@@ -535,7 +716,7 @@ async function createRoom() {
     setNotice(`房间 ${app.room} 已创建，把邀请链接发给对手吧。`);
     // Hand the freshly created row over so the host UI (and its controls)
     // renders before the first poll returns.
-    enterRoom({ code: app.room, board: toBoardPayload(board), host_token: hostToken, host_side: hostSide, game: 1 });
+    await enterRoom({ code: app.room, board: toBoardPayload(board), host_token: hostToken, host_side: hostSide, game: 1 });
   } catch (error) {
     setError(error.message);
   } finally {
@@ -568,7 +749,7 @@ async function joinRoom() {
     app.store = store;
     saveConfig();
     setError('');
-    enterRoom(roomRow);
+    await enterRoom(roomRow);
   } catch (error) {
     setError(error.message);
   } finally {
@@ -581,28 +762,56 @@ function toBoardPayload(board) {
   return { id: board.id, name: board.name, width: board.width, height: board.height, content: board.content };
 }
 
-function enterRoom(roomRow = null) {
+async function enterRoom(roomRow = null) {
   app.roomRow = roomRow;
   app.game = null;
   app.moves = [];
   app.events = [];
   app.state = null;
+  app.members = [];
+  app.roster = [];
+  app.seenDevices = new Set();
+  app.lastNames = new Map();
+  app.presenceReady = false;
+  app.pollCount = 0;
   app.host = Boolean(roomRow && isHost({ room: roomRow, storedToken: loadHostToken(), urlToken: app.urlToken }));
+  app.role = app.host ? ROLE.HOST : null;
+  app.mySide = app.host ? sideForRoleName(roomRow, ROLE.HOST) : null;
   renderRoom();
   updateOwnUrl();
-  sync({ force: true }).then(schedulePoll);
+  // Claim a seat (or land in spectator mode) before the first render of the
+  // board, so the page never briefly shows the wrong side.
+  try {
+    await refreshPresence({ force: true });
+  } catch (error) {
+    setError(error.message);
+  }
+  await sync({ force: true });
+  schedulePoll();
 }
 
 function leaveRoom() {
   stopPoll();
+  if (app.store && app.device) {
+    // Best effort: free the seat (and the name) right away instead of waiting
+    // for the presence timeout to expire.
+    Promise.resolve(app.store.leaveRoom(app.device)).catch(() => {});
+  }
   app.store = null;
   app.roomRow = null;
   app.board = null;
   app.state = null;
   app.moves = [];
   app.events = [];
+  app.members = [];
+  app.roster = [];
+  app.seenDevices = new Set();
+  app.lastNames = new Map();
+  app.presenceReady = false;
+  app.meRow = null;
   app.game = null;
   app.host = false;
+  app.role = null;
   app.mySide = null;
   app.lastEventId = null;
   els.errorLine = null;
@@ -631,6 +840,7 @@ function schedulePoll() {
 async function sync({ force = false } = {}) {
   if (!app.store || app.syncing) return;
   app.syncing = true;
+  app.pollCount += 1;
   try {
     const [roomRow, moveRows, eventRows] = await Promise.all([
       app.store.getRoom(),
@@ -647,6 +857,9 @@ async function sync({ force = false } = {}) {
     const rows = restarted ? await app.store.listMoves(game) : moveRows;
     const events = restarted ? await app.store.listEvents(game) : eventRows;
     applySnapshot({ roomRow, game, moveRows: rows, eventRows: events, restarted });
+    // Presence rides along with the poll: a heartbeat every other tick keeps
+    // the online list fresh without hammering the free tier.
+    await refreshPresence({ force });
   } catch (error) {
     setError(error.message);
   } finally {
@@ -660,9 +873,15 @@ function applySnapshot({ roomRow, game, moveRows, eventRows, restarted }) {
   app.roomRow = roomRow;
   app.game = game;
   app.board = boardFromRoom(roomRow);
-  app.host = isHost({ room: roomRow, storedToken: loadHostToken(), urlToken: app.urlToken });
+  app.host = isHostDevice();
   const previousSide = app.mySide;
-  app.mySide = sideForRole(roomRow, app.host);
+  // The seat (host / opponent / spectator) comes from presence; only the side
+  // has to be re-derived here, because “再来一局（交换先后手）” flips it.
+  if (app.role) app.mySide = sideForRoleName(roomRow, app.role);
+  else if (app.host) {
+    app.role = ROLE.HOST;
+    app.mySide = sideForRoleName(roomRow, ROLE.HOST);
+  }
   const { state, rows, applied, error } = rebuild(moveRows, app.board);
   app.state = state;
   app.moves = rows.slice(0, applied);
@@ -690,6 +909,10 @@ async function submit(x, y) {
     return;
   }
   if (app.submitting) return;
+  if (app.role === ROLE.SPECTATOR) {
+    setNotice('你正在观战：旁观者不能落子。');
+    return;
+  }
   if (state.isGameOver) {
     setNotice('对局已结束，可以由房主开始新一局。');
     return;
@@ -862,28 +1085,28 @@ function renderHistory() {
 
 /* --------------------------------------------------------------- UI sync */
 
-/* ------------------------------------------------------------ rules modal */
+/* --------------------------------------------------------------- modals */
 
-function openRules() {
-  const body = h('div', { class: 'modal-body help-body' });
-  renderRuleSections(body, [...GAME_RULES, ...ONLINE_CONTROLS]);
-  body.append(h('footer', { class: 'modal-footer' }, h('button', { type: 'button', onclick: closeModal }, '知道了')));
+function showModal({ title, subtitle = '', body, footer = null, dismissible = true }) {
   const modal = clear(els.modal);
   modal.append(
     h(
       'header',
       { class: 'modal-header' },
-      h('div', {}, h('h2', { text: '游戏规则' }), h('p', { class: 'modal-subtitle', text: '与单机版共用同一份规则引擎' })),
-      h('button', { type: 'button', class: 'icon-button', title: '关闭', onclick: closeModal }, '✕'),
+      h('div', {}, h('h2', { text: title }), subtitle ? h('p', { class: 'modal-subtitle', text: subtitle }) : null),
+      dismissible ? h('button', { type: 'button', class: 'icon-button', title: '关闭', onclick: () => closeModal() }, '✕') : null,
     ),
     body,
   );
+  if (footer) modal.append(footer);
+  els.modalRoot.dataset.dismissible = dismissible ? 'yes' : 'no';
   els.modalRoot.classList.remove('hidden');
   document.body.classList.add('modal-open');
 }
 
-function closeModal() {
+function closeModal(force = false) {
   if (els.modalRoot.classList.contains('hidden')) return;
+  if (!force && els.modalRoot.dataset.dismissible === 'no') return;
   els.modalRoot.classList.add('hidden');
   document.body.classList.remove('modal-open');
   clear(els.modal);
@@ -893,6 +1116,81 @@ function modalOpen() {
   return !els.modalRoot.classList.contains('hidden');
 }
 
+function openRules() {
+  const body = h('div', { class: 'modal-body help-body' });
+  renderRuleSections(body, [...GAME_RULES, ...ONLINE_CONTROLS]);
+  showModal({
+    title: '游戏规则',
+    subtitle: '与单机版共用同一份规则引擎',
+    body,
+    footer: h('footer', { class: 'modal-footer' }, h('button', { type: 'button', onclick: () => closeModal() }, '知道了')),
+  });
+}
+
+/**
+ * Nickname dialog. On a device's first visit it is mandatory (`required`), so
+ * the room can always show who is online; afterwards it doubles as "rename".
+ */
+function askNickname({ required = false, onSaved = null } = {}) {
+  const input = h('input', {
+    id: 'nickname-input',
+    class: 'text-input',
+    type: 'text',
+    maxlength: '12',
+    placeholder: '例如 小明',
+    value: app.nickname || suggestedNickname(),
+  });
+  const error = h('p', { id: 'nickname-error', class: 'notice notice-left' });
+  const save = h('button', { id: 'nickname-save', class: 'primary', type: 'button' }, required ? '就用这个名字' : '保存昵称');
+
+  const submit = async () => {
+    const value = input.value.trim();
+    if (!value) {
+      error.textContent = '请输入 1-12 个字符的昵称';
+      error.classList.add('is-visible');
+      return;
+    }
+    saveNickname(value);
+    closeModal(true);
+    if (app.phase === 'room') {
+      await refreshPresence({ force: true });
+      syncRoomUI();
+    } else {
+      renderSetup();
+    }
+    if (onSaved) await onSaved();
+  };
+
+  save.addEventListener('click', submit);
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      submit();
+    }
+  });
+
+  showModal({
+    title: required ? '先给自己起个名字' : '修改昵称',
+    subtitle: '每台设备第一次进入时设置一次，之后随时可以改；不需要注册',
+    body: h(
+      'div',
+      { class: 'modal-body' },
+      h('label', { class: 'field' }, h('span', { text: '昵称' }), input),
+      error,
+      h('p', { class: 'hint', text: '昵称会显示在房间成员列表和“轮到你/对手落子”的提示里。' }),
+    ),
+    footer: h(
+      'footer',
+      { class: 'modal-footer' },
+      h('p', { class: 'hint', text: required ? '设置昵称后才能进入房间' : '' }),
+      save,
+    ),
+    dismissible: !required,
+  });
+  if (input.focus) input.focus();
+  if (input.select) input.select();
+}
+
 function syncRoomUI() {
   renderBoard();
   renderHistory();
@@ -900,63 +1198,117 @@ function syncRoomUI() {
 
   const state = app.state;
   const joined = Boolean(app.store && app.roomRow);
+  const spectator = app.role === ROLE.SPECTATOR;
+  const otherSide = app.mySide === Cell.A ? Cell.B : Cell.A;
   els.roomTitle.textContent = `房间 ${app.room}`;
-  els.roleLine.textContent = joined
-    ? `${app.host ? '房主' : '受邀方'} · 我执${sideName(app.mySide)} · 对手执${sideName(app.mySide === Cell.A ? Cell.B : Cell.A)}`
-    : '正在连接…';
+  els.roomNickname.textContent = `我的昵称：${app.nickname || '（未设置）'} · ${joined ? ROLE_LABELS[app.role] || '—' : '未进入房间'}`;
+  els.roleLine.textContent = !joined
+    ? '正在连接…'
+    : !app.role
+      ? '正在分配座位…'
+      : spectator
+        ? '观战中 · 旁观者可以看棋，但不能落子或悔棋'
+        : `${ROLE_LABELS[app.role]} · 我执${sideName(app.mySide)} · 对手执${sideName(otherSide)}`;
+
   if (state) {
     els.statusLine.textContent = describe(state, app.mySide);
     const chipSide = state.isGameOver ? state.winner : state.sideToMove;
+    const turnName = state.isGameOver ? '' : nicknameForSide(app.roster, app.roomRow, state.sideToMove);
     els.turnChip.textContent = state.isGameOver
       ? state.winner !== null
         ? `${sideLabel(state.winner)} 方获胜`
         : '和棋'
       : state.sideToMove === app.mySide
         ? '轮到你落子'
-        : `等待 ${sideLabel(state.sideToMove)} 方落子`;
+        : `等待 ${sideLabel(state.sideToMove)} 方${turnName ? `（${turnName}）` : ''}落子`;
     els.turnChip.className = chipSide === null ? 'turn-chip' : `turn-chip chip-${sideLabel(chipSide).toLowerCase()}`;
     els.statMoves.textContent = String(state.moveHistory.length);
-    els.statSide.textContent = sideName(app.mySide);
+    els.statSide.textContent = spectator ? '观战' : sideName(app.mySide);
     els.statResult.textContent = state.winner !== null ? `${sideLabel(state.winner)} 胜` : state.isDraw ? '和棋' : '进行中';
   } else {
     els.statusLine.textContent = '正在读取房间…';
   }
   els.boardInfo.textContent = app.board ? `棋盘：${boardSummary(app.board)}` : '';
-  els.syncLine.textContent = app.syncAt
-    ? `最近同步：${app.syncAt}${app.syncing ? ' · 同步中…' : ''}${app.host ? ' · 房主' : ''}`
-    : '尚未同步';
+  els.syncLine.textContent = app.syncAt ? `最近同步：${app.syncAt}${app.syncing ? ' · 同步中…' : ''}` : '尚未同步';
   els.invite.value = inviteUrl();
+  renderRoster();
+
+  const seatBusy = activeMembers(app.members, app.serverTime || Date.now()).some(
+    (member) => member.role === ROLE.GUEST && member.device !== app.device,
+  );
+  els.takeSeatButton.classList.toggle('hidden', !(joined && spectator && !seatBusy));
 
   const request = joined && state ? pendingUndo(app.events, app.moves.length) : null;
   const mine = request && request.side === app.mySide;
-  const theirs = request && request.side !== app.mySide;
+  // Only the two players may answer an undo request; spectators just watch.
+  const theirs = Boolean(request) && !spectator && request.side !== app.mySide;
   const plan = joined && state ? undoPlan(app.moves, app.mySide) : null;
-  els.undoRequest.disabled = !joined || !state || state.isGameOver || !plan || Boolean(request) || app.submitting;
+  const canAsk = joined && !spectator && state && !state.isGameOver && Boolean(plan) && !request && !app.submitting;
+  els.undoRequest.classList.toggle('hidden', !joined || spectator);
+  els.undoRequest.disabled = !canAsk;
   els.undoHint.textContent = !joined || !state || mine || theirs
     ? ''
-    : state.isGameOver
-      ? '对局已结束，可以由房主开始新一局。'
-      : plan
-        ? plan.removeCount === 2
-          ? '悔棋会撤回双方各一手，回到你上一手之前（需要对手同意）。'
-          : '悔棋会撤回你刚下的一手（需要对手同意）。'
-        : '你还没有落子，暂时无法悔棋。';
+    : spectator
+      ? '你正在观战：旁观者不能落子或悔棋。'
+      : state.isGameOver
+        ? '对局已结束，可以由房主开始新一局。'
+        : plan
+          ? plan.removeCount === 2
+            ? '悔棋会撤回双方各一手，回到你上一手之前（需要对手同意）。'
+            : '悔棋会撤回你刚下的一手（需要对手同意）。'
+          : '你还没有落子，暂时无法悔棋。';
   els.undoPrompt.classList.toggle('hidden', !theirs);
   if (theirs) {
     const what = request.removeCount === 2 ? '撤回双方各一手' : '撤回最后一手';
     els.undoText.textContent = `${sideLabel(request.side)} 方请求悔棋：${what}（回到第 ${request.target + 1} 手之前），是否同意？`;
   }
-  els.undoStatus.textContent = mine
-    ? '悔棋请求已发出，等待对手回应…'
-    : !joined || !state
-      ? ''
-      : '';
+  els.undoStatus.textContent = mine ? '悔棋请求已发出，等待对手回应…' : '';
 
   const over = Boolean(state && state.isGameOver);
   els.resultBanner.classList.toggle('hidden', !over);
   if (over) els.resultText.textContent = describe(state, app.mySide);
   els.resultHost.classList.toggle('hidden', !app.host);
   els.resultGuest.classList.toggle('hidden', app.host);
+}
+
+/** The online-member list, newest heartbeat first within each role. */
+function renderRoster() {
+  if (!els.rosterList) return;
+  const list = clear(els.rosterList);
+  const now = app.serverTime || Date.now();
+  const online = new Set(activeMembers(app.members, now).map((member) => member.device));
+  if (!app.roster.length) {
+    list.append(h('li', { class: 'history-empty', text: '暂无成员' }));
+    return;
+  }
+  for (const member of app.roster) {
+    const isMe = member.device === app.device;
+    const side = member.side === null || member.side === undefined ? null : Number(member.side);
+    const badges = [ROLE_LABELS[member.role] || member.role];
+    if (side !== null) badges.push(`${sideLabel(side)} 方`);
+    list.append(
+      h(
+        'li',
+        { class: `roster-item${isMe ? ' is-me' : ''}` },
+        h('span', { class: `presence-dot${online.has(member.device) ? ' is-online' : ''}` }),
+        h('span', { class: 'roster-name', text: `${member.nickname}${isMe ? '（你）' : ''}` }),
+        h('span', { class: 'roster-role', text: badges.join(' · ') }),
+      ),
+    );
+  }
+  for (const member of app.members) {
+    if (member.device === app.device || online.has(member.device)) continue;
+    if (app.roster.some((entry) => entry.device === member.device)) continue;
+    list.append(
+      h(
+        'li',
+        { class: 'roster-item is-offline' },
+        h('span', { class: 'presence-dot' }),
+        h('span', { class: 'roster-name', text: member.nickname }),
+        h('span', { class: 'roster-role', text: `${ROLE_LABELS[member.role] || member.role} · 离线` }),
+      ),
+    );
+  }
 }
 
 /* ------------------------------------------------------------------ boot */
@@ -998,14 +1350,17 @@ function boot() {
   app.key = params.key || config.key || '';
   app.room = params.room || '';
   app.urlToken = params.host || '';
+  app.device = loadDevice();
+  app.nickname = loadNickname();
 
   renderSetup();
   renderBoard();
 
-  if (params.room) {
-    // Opened from an invite link (or refreshed mid-game): join straight away.
-    joinRoom();
-  }
+  // Opened from an invite link (or refreshed mid-game): join as soon as the
+  // device has a nickname, which the room uses to show who is online.
+  const continueToRoom = () => (params.room ? joinRoom() : undefined);
+  if (!app.nickname) askNickname({ required: true, onSaved: continueToRoom });
+  else continueToRoom();
   notifyReady();
 }
 

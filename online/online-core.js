@@ -29,6 +29,12 @@ export const EVENT = {
   UNDO_DECLINED: 'undo_declined',
 };
 
+/** Roles inside a room. Only the host and the guest play; everyone else watches. */
+export const ROLE = { HOST: 'host', GUEST: 'guest', SPECTATOR: 'spectator' };
+export const ROLE_LABELS = { host: '房主', guest: '对手', spectator: '观战' };
+/** A device counts as online while its heartbeat is younger than this. */
+export const PRESENCE_TIMEOUT_MS = 15000;
+
 export function defaultBoard() {
   const boards = presetBoards();
   return boards.find((board) => board.id === ONLINE_BOARD_ID) || boards[0];
@@ -86,6 +92,55 @@ export function isHost({ room, storedToken = null, urlToken = null } = {}) {
 export function sideForRole(room, host) {
   const hostSide = Number(room && room.host_side) === Cell.B ? Cell.B : Cell.A;
   return host ? hostSide : otherSide(hostSide);
+}
+
+/** The side a role plays, or `null` for spectators. */
+export function sideForRoleName(room, role) {
+  const hostSide = Number(room && room.host_side) === Cell.B ? Cell.B : Cell.A;
+  if (role === ROLE.HOST) return hostSide;
+  if (role === ROLE.GUEST) return otherSide(hostSide);
+  return null;
+}
+
+/* ------------------------------------------------------------- presence */
+
+/** Members whose heartbeat is fresh enough to count as online. */
+export function activeMembers(members, serverTimeMs, timeoutMs = PRESENCE_TIMEOUT_MS) {
+  return (members || []).filter((member) => {
+    const seen = Date.parse(member.last_seen);
+    if (!Number.isFinite(seen)) return false;
+    return serverTimeMs - seen <= timeoutMs;
+  });
+}
+
+/**
+ * Which role this device should hold.
+ *
+ * The host keeps their seat through the host token; the first other device to
+ * arrive becomes the opponent, and everybody after that watches — the
+ * database additionally enforces a single guest seat, so a race cannot make
+ * two devices believe they are the opponent.
+ */
+export function roleFor({ room, members, device, serverTimeMs, isHostDevice }) {
+  const active = activeMembers(members, serverTimeMs);
+  const mine = (members || []).find((member) => member.device === device) || null;
+  if (isHostDevice) return ROLE.HOST;
+  if (active.some((member) => member.role === ROLE.GUEST && member.device !== device)) return ROLE.SPECTATOR;
+  // A device keeps whatever seat it already holds; only a first-time arrival
+  // (no member row yet) takes the free opponent seat. That is what makes the
+  // second invitee a spectator instead of a second "opponent", and it stops a
+  // spectator from silently being promoted when the seat frees up.
+  if (mine) return mine.role;
+  return ROLE.GUEST;
+}
+
+/** Nicknames keyed by side, used to label whose turn it is. */
+export function nicknameForSide(members, room, side) {
+  if (side === null || side === undefined) return '';
+  const hostSide = Number(room && room.host_side) === Cell.B ? Cell.B : Cell.A;
+  const role = Number(side) === hostSide ? ROLE.HOST : ROLE.GUEST;
+  const member = (members || []).find((entry) => entry.role === role);
+  return member ? member.nickname : '';
 }
 
 export function boardFromRoom(room) {

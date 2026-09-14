@@ -110,6 +110,60 @@
   font-size: 0.86rem;
 }
 
+.roster {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.roster-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel-soft);
+  border-radius: 9px;
+  padding: 6px 10px;
+  font-size: 0.86rem;
+}
+
+.roster-item.is-me {
+  border: 1px solid rgba(255, 224, 119, 0.45);
+}
+
+.roster-item.is-offline {
+  opacity: 0.55;
+}
+
+.presence-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #6b7684;
+  flex: 0 0 auto;
+}
+
+.presence-dot.is-online {
+  background: #5fd08a;
+  box-shadow: 0 0 6px rgba(95, 208, 138, 0.8);
+}
+
+.roster-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.roster-role {
+  color: var(--muted);
+  font-size: 0.76rem;
+  white-space: nowrap;
+}
+
+.undo-prompt {
 /* Keep the board a touch smaller than the solo build so the cards fit on a
    laptop screen. */
 .board {

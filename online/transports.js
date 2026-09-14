@@ -25,6 +25,7 @@ export function createSupabaseStore({ url, key, room, fetchImpl = globalThis.fet
   const rooms = `${base}/rest/v1/rooms`;
   const moves = `${base}/rest/v1/moves`;
   const events = `${base}/rest/v1/events`;
+  const members = `${base}/rest/v1/members`;
   const roomFilter = `room=eq.${encodeURIComponent(code)}`;
 
   const detail = async (response) => {
@@ -142,6 +143,64 @@ export function createSupabaseStore({ url, key, room, fetchImpl = globalThis.fet
       ]);
       const bad = responses.find((response) => !response.ok);
       return bad ? failure(bad, '关闭房间') : { ok: true };
+    },
+
+    /**
+     * Everyone who has ever sat in this room, plus the server clock (taken
+     * from the HTTP `Date` header) so staleness is judged against the
+     * database's time rather than the local one.
+     */
+    async listMembers() {
+      const response = await fetchImpl(
+        `${members}?${roomFilter}&select=device,nickname,role,side,joined_at,last_seen&order=joined_at.asc`,
+        { headers },
+      );
+      if (!response.ok) throw new Error(`读取房间成员失败：HTTP ${response.status}${await detail(response)}`);
+      const rows = await response.json();
+      const serverTime = Date.parse(response.headers && response.headers.get ? response.headers.get('date') : '') || Date.now();
+      return { members: Array.isArray(rows) ? rows : [], serverTime };
+    },
+
+    /**
+     * Create or refresh this device's member row (heartbeat + rename + seat).
+     * `last_seen` is stamped by a database trigger, so all devices agree on it.
+     */
+    async heartbeat({ device, nickname, role, side = null }) {
+      const response = await fetchImpl(`${members}?on_conflict=room,device`, {
+        method: 'POST',
+        headers: { ...headers, Prefer: 'resolution=merge-duplicates,return=minimal' },
+        body: JSON.stringify([{ room: code, device, nickname, role, side }]),
+      });
+      if (response.ok) return { ok: true };
+      if (response.status === 409) return { ok: false, conflict: true, reason: '对手座位已经被占用' };
+      return failure(response, '同步在线状态');
+    },
+
+    /** Move this device's row to a specific role (used when taking a seat). */
+    async setMemberRole({ device, role, side = null }) {
+      const response = await fetchImpl(
+        `${members}?${roomFilter}&device=eq.${encodeURIComponent(device)}`,
+        {
+          method: 'PATCH',
+          headers: { ...headers, Prefer: 'return=minimal' },
+          body: JSON.stringify({ role, side }),
+        },
+      );
+      return response.ok ? { ok: true } : failure(response, '切换身份');
+    },
+
+    /** Remove a stale member row so a waiting spectator can take the seat. */
+    async dropMember(device) {
+      const response = await fetchImpl(
+        `${members}?${roomFilter}&device=eq.${encodeURIComponent(device)}`,
+        { method: 'DELETE', headers },
+      );
+      return response.ok ? { ok: true } : failure(response, '清理离线成员');
+    },
+
+    /** Best-effort cleanup when leaving a room. */
+    async leaveRoom(device) {
+      return this.dropMember(device);
     },
   };
 }

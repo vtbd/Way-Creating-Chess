@@ -49,9 +49,10 @@ let dom = null;
 let el = () => null;
 
 /** Install a fresh DOM and boot a fresh copy of the page module. */
-async function startPage({ search = '', tag } = {}) {
+async function startPage({ search = '', tag, nickname = '小测' } = {}) {
   dom = installDom(webRoot, { page: 'online/index.html', search });
   el = (id) => dom.document.querySelector(`#${id}`);
+  if (nickname) dom.window.localStorage.setItem('wcc.online.nickname.v1', nickname);
   await import(`../online/online.js?instance=${tag}`);
   await settle();
   return dom;
@@ -339,8 +340,7 @@ test('the invited side joins from the link, gets the other side and no host cont
   const search = `?room=HOST1&url=${encodeURIComponent(SUPABASE_URL)}&key=${SUPABASE_KEY}`;
   await startPage({ tag: 'guest', search });
 
-  assert.match(el('role-line').textContent, /受邀方/);
-  assert.match(el('role-line').textContent, /后手/, 'the joiner automatically takes the other side');
+  assert.match(el('role-line').textContent, /^对手 · 我执后手/, 'the joiner automatically takes the other side');
   assert.equal(el('clear-room'), null, 'the joiner has no destructive controls');
   assert.equal(el('url'), null, 'the joiner never sees the project URL input');
   assert.equal(el('key'), null, 'the joiner never sees the anon key input');
@@ -446,4 +446,86 @@ test('a room that no longer exists is reported instead of joining', async () => 
   await settle();
   assert.match(el('notice').textContent, /不存在/);
   assert.match(el('sidebar').textContent, /创建房间/);
+});
+
+test('a device must pick a nickname before it can enter a room', async () => {
+  el('leave') && el('leave').fire('click');
+  const search = `?room=HOST1&url=${encodeURIComponent(SUPABASE_URL)}&key=${SUPABASE_KEY}`;
+  await startPage({ tag: 'nickname', search, nickname: null });
+
+  assert.ok(el('nickname-input'), 'the first visit asks for a nickname');
+  assert.equal(el('room-title'), null, 'the room is not joined until the name is set');
+
+  el('nickname-input').value = '小明';
+  el('nickname-save').fire('click');
+  await settle();
+
+  assert.match(el('room-title').textContent, /房间 HOST1/);
+  assert.match(el('room-nickname').textContent, /小明/);
+  const mine = fake.membersOf('HOST1').find((member) => member.nickname === '小明');
+  assert.ok(mine, 'the presence row carries the nickname');
+  assert.equal(mine.role, 'guest', 'the first invitee takes the opponent seat');
+
+  // The name can be changed at any time.
+  el('change-nickname-room').fire('click');
+  el('nickname-input').value = '小明明';
+  el('nickname-save').fire('click');
+  await settle();
+  assert.match(el('room-nickname').textContent, /小明明/);
+  const renamed = fake.membersOf('HOST1').find((member) => member.device === mine.device);
+  assert.equal(renamed.nickname, '小明明');
+});
+
+test('later invitees join as spectators and cannot play', async () => {
+  el('leave') && el('leave').fire('click');
+  // Somebody else already holds the opponent seat.
+  fake.injectMember({ room: 'HOST1', device: 'other-device', nickname: '小刚', role: 'guest', side: Cell.B });
+  const search = `?room=HOST1&url=${encodeURIComponent(SUPABASE_URL)}&key=${SUPABASE_KEY}`;
+  await startPage({ tag: 'spectator', search, nickname: '小美' });
+
+  assert.match(el('role-line').textContent, /观战中/);
+  assert.equal(el('undo-request').classList.contains('hidden'), true, 'spectators get no 悔棋 button');
+  assert.equal(el('undo-prompt').classList.contains('hidden'), true, 'spectators cannot answer 悔棋 requests');
+  assert.equal(el('take-seat').classList.contains('hidden'), true, 'the seat is occupied');
+
+  const roster = el('roster').textContent;
+  assert.match(roster, /小美（你）/);
+  assert.match(roster, /观战/);
+  assert.match(roster, /小刚/);
+  assert.match(roster, /对手 · B 方/);
+  assert.equal(el('roster').querySelectorAll('.roster-item').length, 2);
+
+  cellAt(0, 0).fire('pointerdown', { button: 0 });
+  await settle();
+  assert.match(el('notice').textContent, /旁观者不能落子/);
+});
+
+test('the roster reports members joining and leaving', async () => {
+  fake.injectMember({ room: 'HOST1', device: 'third-device', nickname: '小强', role: 'spectator' });
+  el('sync').fire('click');
+  await settle();
+  assert.match(el('notice').textContent, /小强 进入观战/);
+  assert.match(el('roster').textContent, /小强/);
+
+  fake.advance(20000); // 小强 stops sending heartbeats
+  el('sync').fire('click');
+  await settle();
+  assert.match(el('notice').textContent, /小强 离开了房间/);
+  assert.match(el('roster').textContent, /离线/);
+});
+
+test('a spectator can take the opponent seat once it is free', async () => {
+  el('sync').fire('click');
+  await settle();
+  assert.equal(el('take-seat').classList.contains('hidden'), false, 'the seat is free again');
+
+  el('take-seat').fire('click');
+  await settle();
+  assert.match(el('role-line').textContent, /^对手 · 我执后手/, 'the spectator is now the opponent');
+  assert.equal(el('undo-request').classList.contains('hidden'), false, 'players get the 悔棋 button back');
+
+  const myDevice = dom.window.localStorage.getItem('wcc.online.device.v1');
+  const mine = fake.membersOf('HOST1').find((member) => member.device === myDevice);
+  assert.equal(mine.role, 'guest');
+  assert.equal(Number(mine.side), Cell.B);
 });

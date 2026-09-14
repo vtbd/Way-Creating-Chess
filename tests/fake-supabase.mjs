@@ -8,13 +8,18 @@
  */
 
 export function createFakeSupabase() {
-  const db = { rooms: [], moves: [], events: [] };
+  const db = { rooms: [], moves: [], events: [], members: [] };
   const calls = [];
   let moveId = 0;
   let eventId = 0;
+  let clock = Date.parse('2026-09-14T08:00:00Z');
 
-  const ok = (data, status = 200) => ({ ok: true, status, json: async () => data, text: async () => '' });
-  const fail = (status, text) => ({ ok: false, status, json: async () => [], text: async () => text });
+  const headers = () => ({
+    get: (name) => (String(name).toLowerCase() === 'date' ? new Date(clock).toUTCString() : null),
+  });
+  const ok = (data, status = 200) => ({ ok: true, status, headers: headers(), json: async () => data, text: async () => '' });
+  const fail = (status, text) => ({ ok: false, status, headers: headers(), json: async () => [], text: async () => text });
+  const stamp = () => new Date(clock).toISOString();
 
   function select(rows, params, order) {
     let out = rows.slice();
@@ -95,6 +100,33 @@ export function createFakeSupabase() {
       }
     }
 
+    if (table === 'members') {
+      if (method === 'GET') return ok(select(db.members, params, params.get('order')));
+      if (method === 'POST') {
+        const row = body[0];
+        const existing = db.members.find((member) => member.room === row.room && member.device === row.device);
+        if (existing) {
+          Object.assign(existing, row, { last_seen: stamp() });
+          return ok([], 201);
+        }
+        // Mirrors the partial unique index that keeps a single opponent seat.
+        if (row.role === 'guest' && db.members.some((member) => member.room === row.room && member.role === 'guest')) {
+          return fail(409, 'duplicate key value violates unique constraint "members_room_guest_unique"');
+        }
+        db.members.push({ joined_at: stamp(), last_seen: stamp(), ...row });
+        return ok([], 201);
+      }
+      if (method === 'PATCH') {
+        for (const row of select(db.members, params)) Object.assign(row, body, { last_seen: stamp() });
+        return ok([], 204);
+      }
+      if (method === 'DELETE') {
+        const doomed = new Set(select(db.members, params));
+        db.members = db.members.filter((member) => !doomed.has(member));
+        return ok([], 204);
+      }
+    }
+
     return fail(404, `unknown table ${table}`);
   };
 
@@ -102,9 +134,27 @@ export function createFakeSupabase() {
     db,
     calls,
     fetchImpl,
+    /** Move the fake server clock (presence is judged against it). */
+    advance(ms) {
+      clock += ms;
+    },
+    now: () => clock,
     room: (code) => db.rooms.find((row) => row.code === code) || null,
     movesOf: (code, game = 1) => db.moves.filter((row) => row.room === code && Number(row.game) === Number(game)),
     eventsOf: (code, game = 1) => db.events.filter((row) => row.room === code && Number(row.game) === Number(game)),
+    membersOf: (code) => db.members.filter((row) => row.room === code),
+    /** Pretend another device is sitting in the room (a guest or a spectator). */
+    injectMember({ room, device, nickname, role, side = null, lastSeenAgoMs = 0 }) {
+      db.members.push({
+        room,
+        device,
+        nickname,
+        role,
+        side,
+        joined_at: stamp(),
+        last_seen: new Date(clock - lastSeenAgoMs).toISOString(),
+      });
+    },
     /** Pretend the other player played this move (no page involved). */
     injectMove({ room, game = 1, moveIndex, side, x, y }) {
       moveId += 1;
