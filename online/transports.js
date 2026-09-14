@@ -28,15 +28,36 @@ export function createSupabaseStore({ url, key, room, fetchImpl = globalThis.fet
   const members = `${base}/rest/v1/members`;
   const roomFilter = `room=eq.${encodeURIComponent(code)}`;
 
-  const detail = async (response) => {
+  /** PostgREST reports a stale schema as PGRST204/PGRST205 (or raw PG codes). */
+  const SCHEMA_HINT =
+    '数据库结构不是最新的：请在 Supabase 的 SQL Editor 里重跑 online/README.md 第二步的整段 SQL（补齐 rooms.main_ms、rooms.move_ms、members.ready_game、members.ready_at），再执行一次 NOTIFY pgrst, \'reload schema\';';
+
+  const readError = async (response) => {
+    let text = '';
     try {
-      const text = (await response.text()).slice(0, 200);
-      return text ? ` · ${text}` : '';
+      text = (await response.text()) || '';
     } catch (error) {
-      return '';
+      text = '';
     }
+    let payload = null;
+    try {
+      payload = JSON.parse(text);
+    } catch (error) {
+      payload = null;
+    }
+    const code = payload && payload.code;
+    const stale = code === 'PGRST204' || code === 'PGRST205' || code === '42P01' || code === '42703';
+    return { text: text.slice(0, 200), hint: stale ? SCHEMA_HINT : '' };
   };
-  const failure = async (response, action) => ({ ok: false, reason: `${action}失败：HTTP ${response.status}${await detail(response)}` });
+  const detail = async (response) => {
+    const { text } = await readError(response);
+    return text ? ` · ${text}` : '';
+  };
+  const failure = async (response, action) => {
+    const { text, hint } = await readError(response);
+    const suffix = text ? ` · ${text}` : '';
+    return { ok: false, reason: `${action}失败：HTTP ${response.status}${suffix}${hint ? `　→ ${hint}` : ''}` };
+  };
 
   return {
     code,
@@ -191,14 +212,18 @@ export function createSupabaseStore({ url, key, room, fetchImpl = globalThis.fet
       return failure(response, '同步在线状态');
     },
 
-    /** Move this device's row to a specific role (used when taking a seat). */
-    async setMemberRole({ device, role, side = null }) {
+    /**
+     * Change one device's seat. Used by the host to promote/demote members and
+     * to remove them (`role: 'kicked'`); `ready_game` is cleared so a seat
+     * change always starts un-ready.
+     */
+    async setMemberRole({ device, role, side = null, readyGame = 0 }) {
       const response = await fetchImpl(
         `${members}?${roomFilter}&device=eq.${encodeURIComponent(device)}`,
         {
           method: 'PATCH',
           headers: { ...headers, Prefer: 'return=minimal' },
-          body: JSON.stringify({ role, side }),
+          body: JSON.stringify({ role, side, ready_game: readyGame }),
         },
       );
       return response.ok ? { ok: true } : failure(response, '切换身份');

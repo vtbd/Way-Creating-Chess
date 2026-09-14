@@ -20,6 +20,9 @@ import {
   CLOCK_DEFAULTS,
   COUNTDOWN_MS,
   EVENT,
+  PRESENCE_TIMEOUT_MS,
+  ROLE,
+  activeMembers,
   boardFromRoom,
   buildInviteUrl,
   clockSettings,
@@ -39,7 +42,7 @@ import {
   undoPlan,
 } from '../online/online-core.js';
 import { createSupabaseStore } from '../online/transports.js';
-import { installDom } from './dom-shim.mjs';
+import { findByText, installDom } from './dom-shim.mjs';
 import { createFakeSupabase } from './fake-supabase.mjs';
 
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -93,12 +96,9 @@ async function goLive(roomCode, { pressReady = true } = {}) {
   await settle();
 }
 
-/** Refresh both seats' heartbeats (what a real client does every couple of seconds). */
+/** Refresh every member's heartbeat (what real clients do every couple of seconds). */
 function keepAlive(roomCode) {
-  for (const role of ['host', 'guest']) {
-    const seat = fake.findMember(roomCode, role);
-    if (seat) fake.touchMember(seat.device);
-  }
+  for (const member of fake.membersOf(roomCode)) fake.touchMember(member.device);
 }
 
 let dom = null;
@@ -275,6 +275,28 @@ test('the store speaks the documented REST dialect', async () => {
   assert.match(duplicate.reason, /已被占用/);
 });
 
+test('a database missing the new columns explains how to fix it', async () => {
+  const stale = createSupabaseStore({
+    url: 'https://demo.supabase.co',
+    key: 'eyJtest',
+    room: 'OLD1',
+    fetchImpl: async () => ({
+      ok: false,
+      status: 400,
+      headers: { get: () => null },
+      json: async () => [],
+      text: async () =>
+        '{"code":"PGRST204","details":null,"hint":null,"message":"Could not find the \'main_ms\' column of \'rooms\' in the schema cache"}',
+    }),
+  });
+  const result = await stale.createRoom({ board: { width: 1, height: 1, content: [[1]] }, hostToken: 't', hostSide: Cell.A, mainMs: 600000, moveMs: 90000 });
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /HTTP 400/);
+  assert.match(result.reason, /数据库结构不是最新的/);
+  assert.match(result.reason, /rooms\.main_ms/);
+  assert.match(result.reason, /reload schema/);
+});
+
 /* ------------------------------------------------------------------ clock */
 
 const T0 = Date.parse('2026-09-14T08:00:00Z');
@@ -298,6 +320,13 @@ test('clock settings fall back to the 10 minute / 90 second defaults', () => {
   assert.equal(formatClock(95000), '1:35');
   assert.equal(formatClock(-500), '0:00');
   assert.equal(formatClock(3600000), '1:00:00');
+});
+
+test('a device is offline after five seconds without a heartbeat', () => {
+  assert.equal(PRESENCE_TIMEOUT_MS, 5000);
+  const members = [memberRow('host', Cell.A, 0, null, T0)];
+  assert.equal(activeMembers(members, T0 + 4000).length, 1, 'still online just under the limit');
+  assert.equal(activeMembers(members, T0 + 6000).length, 0, 'offline once the limit passes');
 });
 
 test('the countdown starts only after both players are ready', () => {
@@ -410,7 +439,10 @@ test('the host creates a room, keeps host controls and plays a move', async () =
   assert.equal(/host=/.test(invite), false, 'host rights are never shared');
 
   // No opponent yet: the host may not play, and the clock has not started.
-  assert.match(el('ready-hint').textContent, /还没有对手/);
+  assert.match(el('ready-hint').textContent, /等待对手加入/);
+  assert.equal(el('status-line').textContent, '请准备', 'before the game the status asks for ready');
+  assert.equal(el('turn-chip').textContent, '请准备');
+  assert.equal(el('ready-button').classList.contains('hidden'), false, 'the ready button is offered');
   cellAt(0, 0).fire('pointerdown', { button: 0 });
   await settle();
   assert.match(el('notice').textContent, /还没有对手/);
@@ -422,6 +454,8 @@ test('the host creates a room, keeps host controls and plays a move', async () =
   fake.injectMember({ room: 'HOST1', device: 'guest-device', nickname: '小刚', role: 'guest', side: Cell.B });
   await goLive('HOST1');
   assert.equal(el('countdown').classList.contains('hidden'), true, 'the countdown is over');
+  assert.equal(el('ready-button').classList.contains('hidden'), true, 'ready is hidden while a game is live');
+  assert.match(el('status-line').textContent, /轮到你落子|等待/);
 
   assert.ok(cellAt(0, 0).classList.contains('is-legal'));
   cellAt(0, 0).fire('pointerdown', { button: 0 });
@@ -748,4 +782,76 @@ test('a clock timeout is recorded once and ends the game', async () => {
   await settle(20);
   assert.equal(fake.eventsOf('CLOCK1').filter((event) => event.kind === EVENT.CLOCK_TIMEOUT).length, 1);
   assert.ok(cellAt(0, 0).classList.contains('is-legal') === false, 'the board is closed after the timeout');
+
+  // A finished game: the status says so, ready is cleared and offered again.
+  assert.equal(el('status-line').textContent, '游戏结束');
+  assert.equal(el('turn-chip').textContent, '游戏结束');
+  assert.equal(el('ready-button').classList.contains('hidden'), false, 'ready comes back between games');
+  assert.equal(el('ready-button').textContent, '准备完毕');
+  const hostSeat = fake.findMember('CLOCK1', 'host');
+  assert.equal(Number(hostSeat.ready_game), 0, 'a finished game cancels the ready flag');
+});
+
+test('the host can swap, demote and remove members between games', async () => {
+  el('leave') && el('leave').fire('click');
+  // A fresh host page owns JSON1 again (its token is in the invite URL).
+  await startPage({ tag: 'manager' });
+  el('url').value = SUPABASE_URL;
+  el('key').value = SUPABASE_KEY;
+  el('room-input').value = 'MANAGE1';
+  el('create-room').fire('click');
+  await settle();
+
+  fake.injectMember({ room: 'MANAGE1', device: 'm-guest', nickname: '小刚', role: 'guest', side: Cell.B });
+  fake.injectMember({ room: 'MANAGE1', device: 'm-watch', nickname: '小美', role: 'spectator' });
+  await goLive('MANAGE1');
+
+  // While the clock runs the roster is locked.
+  assert.match(el('roster-hint').textContent, /对局进行中/);
+  assert.equal(findByText(el('roster'), '降为旁观', 'button').disabled, true, 'no swaps mid-game');
+  assert.equal(findByText(el('roster'), '移出', 'button').disabled, true, 'no kicks mid-game');
+
+  // End the game (A runs out of step time), then the host may manage seats.
+  fake.advance(95000);
+  keepAlive('MANAGE1');
+  el('sync').fire('click');
+  await settle(20);
+  await realWait(250);
+  await settle(20);
+  assert.equal(el('roster-hint').textContent, '', 'the roster unlocks after the game');
+
+  findByText(el('roster'), '选为对手', 'button').fire('click');
+  await settle(20);
+  assert.equal(fake.findMember('MANAGE1', 'guest').nickname, '小美', 'the spectator moved to the opponent seat');
+  assert.equal(Number(fake.findMember('MANAGE1', 'guest').side), Cell.B);
+  const demoted = fake.memberByDevice('m-guest');
+  assert.equal(demoted.role, ROLE.SPECTATOR, 'the previous opponent was demoted');
+
+  findByText(el('roster'), '降为旁观', 'button').fire('click');
+  await settle(20);
+  assert.equal(fake.findMember('MANAGE1', 'guest'), null, 'nobody holds the opponent seat now');
+
+  findByText(el('roster'), '移出', 'button').fire('click');
+  await settle(20);
+  const kicked = fake.db.members.find((member) => member.role === ROLE.KICKED);
+  assert.ok(kicked, 'a member was removed');
+  assert.equal(el('roster').textContent.includes(kicked.nickname), false, 'removed members leave the roster');
+});
+
+test('a device the host removed leaves the room on its own', async () => {
+  el('leave') && el('leave').fire('click');
+  fake.injectMember({ room: 'HOST1', device: 'seat-holder', nickname: '小刚', role: 'guest', side: Cell.B });
+  const search = `?room=HOST1&url=${encodeURIComponent(SUPABASE_URL)}&key=${SUPABASE_KEY}`;
+  await startPage({ tag: 'kicked', search, nickname: '小美' });
+  assert.match(el('role-line').textContent, /观战中/);
+
+  // The host removes this device.
+  const myDevice = dom.window.localStorage.getItem('wcc.online.device.v1');
+  fake.memberByDevice(myDevice).role = ROLE.KICKED;
+  el('sync').fire('click');
+  await settle(20);
+
+  assert.match(el('notice').textContent, /移出房间/);
+  assert.match(el('sidebar').textContent, /创建房间/, 'the removed device is back on the setup screen');
+  assert.equal(fake.memberByDevice(myDevice).role, ROLE.KICKED, 'the row stays so it cannot sneak back in');
 });

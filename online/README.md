@@ -13,11 +13,12 @@
 | 邀请链接 | 自动带上项目 URL、anon key、房间号；对手打开即自动加入并自动执另一方 |
 | 权限区分 | 房主保留全部控制（清空房间、关闭房间、再来一局）；受邀方看不到连接设置与这些按钮，也看不到 URL/key 输入框 |
 | 昵称登录 | 每台设备第一次进入时要求填一个昵称（1-12 字，不需要注册），之后随时可以修改 |
-| 在线成员 | 房间成员列表显示昵称、身份（房主 / 对手 / 观战）与在线状态；每约 2 秒心跳一次，超过 15 秒没有心跳视为离线并移出名单 |
+| 在线成员 | 房间成员列表显示昵称、身份（房主 / 对手 / 观战）与在线状态；每约 1.4 秒心跳一次，超过 5 秒没有心跳视为离线并移出在线名单 |
 | 旁观模式 | 第一个通过邀请链接进入的人成为对手，之后进入的人自动成为旁观者（数据库层面只允许一个对手座位）；旁观者可以看棋、看成员列表，但不能落子、悔棋或管理房间 |
 | 接替对手 | 对手座位空出来（或对手离线）时，旁观者会出现"接替对手"按钮，点一下即可上座 |
+| 房主管理成员 | 房主可以在成员列表里把对手"降为旁观"、把旁观者"选为对手"，或把任意成员"移出"房间；**对局进行中（棋钟走动时）这些按钮全部锁定**，一局结束后才能更换对手 |
 | 棋钟 | 每方一个局时（默认 10 分钟）和一个步时（默认 90 秒），房主建房时可选；任一方局时用尽或单步超过步时即判负 |
-| 准备与读秒 | 双方都点"准备完毕"后统一读秒 3 秒，随后才开始计时与行棋；对手没进来之前房主无法落子 |
+| 准备与读秒 | 双方都点"准备完毕"后统一读秒 3 秒，随后才开始计时与行棋；对局开始后"准备完毕"按钮自动隐藏，一局结束会自动取消双方准备并重新显示 |
 | 悔棋 | 任意一方可"悔棋"，由对手同意/拒绝后才生效；在自己回合悔棋会撤回双方各一手（回到你上一手之前），刚下完就悔棋只撤回你那一手；对手若直接落子，请求自动失效 |
 | 再来一局 | 对局结束后房主可"再来一局"或"再来一局（交换先后手）"，双方同时重置 |
 | 关闭房间 | 房主可删除房间，房间号随之释放；对手会看到"房间已不存在" |
@@ -33,6 +34,32 @@
 ## 第二步：建表（复制运行一次即可）
 
 左侧 **SQL Editor → New query**，粘贴下面的 SQL，点 **Run**：
+
+> **已经建过表？** 只需补跑这段"升级"SQL（幂等，可重复执行），它会补齐棋钟与准备状态需要的字段：
+>
+> ```sql
+> alter table public.rooms add column if not exists main_ms integer not null default 600000;
+> alter table public.rooms add column if not exists move_ms integer not null default 90000;
+> alter table public.members add column if not exists ready_game integer not null default 0;
+> alter table public.members add column if not exists ready_at timestamptz;
+>
+> create or replace function public.touch_members() returns trigger as $$
+> begin
+>   new.last_seen := now();
+>   if tg_op = 'INSERT' or new.ready_game is distinct from old.ready_game then
+>     new.ready_at := now();
+>   end if;
+>   return new;
+> end $$ language plpgsql;
+>
+> drop trigger if exists members_touch on public.members;
+> create trigger members_touch before insert or update on public.members
+>   for each row execute function public.touch_members();
+>
+> notify pgrst, 'reload schema';
+> ```
+>
+> 如果页面提示 `Could not find the 'main_ms' column of 'rooms' in the schema cache`（PGRST204），就是漏了这一段。
 
 ```sql
 -- 房间：棋盘定义、房主令牌、房主执子、当前局号
@@ -197,7 +224,9 @@ grant usage, select on all sequences in schema public to anon;
 | `HTTP 404` / `column ... does not exist` | SQL 没跑完整；重跑第二步的整段（可重复执行） |
 | 为什么后来的人是旁观 | 这是有意的：第一个进入的人成为对手，其余人进入观战，数据库只允许一个对手座位。对手离线或退出后，旁观者会出现"接替对手"按钮 |
 | 昵称怎么改 | 房间内点 **修改昵称**（或初始界面上的同名按钮）即可，改名会同步给房间里所有人 |
-| 成员显示"离线" | 心跳超过 15 秒没更新（关掉标签页、断网、手机锁屏过久等）。重新打开页面或点"立即同步"即可恢复在线 |
+| 成员显示"离线" | 心跳超过 5 秒没更新（关掉标签页、断网、手机锁屏过久等）。重新打开页面或点"立即同步"即可恢复在线 |
+| 被房主移出后还能回来吗 | 不能：该设备的成员行会被标记为 `kicked`，它自己会退出房间，之后重新打开邀请链接也会被拒绝。想让他回来，需要在 Supabase 里删掉 `members` 表里那一行 |
+| 对局中为什么换不了对手 | 棋钟走动的这局不允许换人，避免局面和身份错位；一局结束后（含超时判负）按钮自动解锁 |
 | 棋钟怎么算的 | 每手的时间由数据库时间戳推算：这一手从"上一手落下的时刻"开始计时，双方各自算出同一个剩余时间，所以不会出现两边表不一致 |
 | 超时判负由谁裁决 | 任何一个在线客户端发现超时都会写一条 `clock_timeout` 事件（同一局只写一次），两边据此判定胜负；超时方是"轮到走棋的那一方" |
 | 房主为什么点不动棋盘 | 对手还没进来，或双方还没都点"准备完毕"，或读秒还没结束；侧栏的提示会写明当前差在哪一步 |

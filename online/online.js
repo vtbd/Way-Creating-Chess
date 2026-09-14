@@ -47,6 +47,7 @@ import {
   recordedTimeout,
   resolveHostSide,
   roleFor,
+  rosterLocked,
   sideForRoleName,
   sideLabel,
   sideName,
@@ -62,7 +63,7 @@ const NICKNAME_KEY = 'wcc.online.nickname.v1';
     devices within a fraction of a second of each other. */
 const POLL_MS = 700;
 /** Presence heartbeat interval (multiples of the poll). */
-const HEARTBEAT_EVERY = 3;
+const HEARTBEAT_EVERY = 2;
 /** Local clock repaint interval (no network involved). */
 const CLOCK_TICK_MS = 200;
 
@@ -278,6 +279,10 @@ async function refreshPresence({ force = false } = {}) {
     side,
     readyGame: app.readyGame,
   });
+  if (role === ROLE.KICKED) {
+    applyRoster({ members, serverTime, role, side: null });
+    return;
+  }
   if (!result.ok && result.conflict) {
     role = ROLE.SPECTATOR;
     side = null;
@@ -318,7 +323,7 @@ function applyRoster({ members, serverTime, role, side }) {
   app.meRow = self;
   app.roster = activeMembers([...members.filter((member) => member.device !== app.device), self], serverTime).sort(
     (a, b) => ROLE_ORDER[a.role] - ROLE_ORDER[b.role] || Date.parse(a.joined_at) - Date.parse(b.joined_at),
-  );
+  ).filter((member) => member.role !== ROLE.KICKED);
   for (const member of app.roster) app.lastNames.set(member.device, member.nickname);
   announcePresenceChanges();
 }
@@ -453,6 +458,83 @@ async function toggleReady() {
   setNotice(next ? '已准备完毕，等待对手…' : '已取消准备。');
   await refreshPresence({ force: true });
   syncRoomUI();
+}
+
+/**
+ * A finished game clears both ready flags (each client clears its own), so the
+ * 准备完毕 button comes back for the next round without anyone having to
+ * un-ready manually.
+ */
+function maybeResetReady() {
+  if (!app.store || app.readyGame < (app.game || 1)) return;
+  if (app.role !== ROLE.HOST && app.role !== ROLE.GUEST) return;
+  app.readyGame = 0;
+  Promise.resolve(
+    app.store.heartbeat({
+      device: app.device,
+      nickname: app.nickname,
+      role: app.role,
+      side: app.mySide,
+      readyGame: 0,
+    }),
+  ).catch(() => {});
+}
+
+/* ------------------------------------------------- host: seat management */
+
+async function kickMember(member) {
+  if (!app.host || rosterLocked(app.readiness, app.outcome)) return;
+  const result = await app.store.setMemberRole({
+    device: member.device,
+    role: ROLE.KICKED,
+    side: null,
+    readyGame: 0,
+  });
+  setNotice(result.ok ? `已将 ${member.nickname} 移出房间。` : result.reason);
+  await refreshPresence({ force: true });
+  syncRoomUI();
+}
+
+async function demoteOpponent(member) {
+  if (!app.host || rosterLocked(app.readiness, app.outcome)) return;
+  const result = await app.store.setMemberRole({
+    device: member.device,
+    role: ROLE.SPECTATOR,
+    side: null,
+    readyGame: 0,
+  });
+  setNotice(result.ok ? `${member.nickname} 已降为旁观。` : result.reason);
+  await refreshPresence({ force: true });
+  syncRoomUI();
+}
+
+async function promoteToOpponent(member) {
+  if (!app.host || rosterLocked(app.readiness, app.outcome)) return;
+  const current = activeMembers(app.members, app.serverTime || Date.now()).find(
+    (entry) => entry.role === ROLE.GUEST && entry.device !== member.device,
+  );
+  if (current) {
+    await app.store.setMemberRole({ device: current.device, role: ROLE.SPECTATOR, side: null, readyGame: 0 });
+  }
+  const side = sideForRoleName(app.roomRow, ROLE.GUEST);
+  const result = await app.store.setMemberRole({
+    device: member.device,
+    role: ROLE.GUEST,
+    side,
+    readyGame: 0,
+  });
+  setNotice(result.ok ? `${member.nickname} 已成为对手（执${sideName(side)}）。` : result.reason);
+  await refreshPresence({ force: true });
+  syncRoomUI();
+}
+
+/** A device the host removed leaves on its own and must not re-create its row. */
+function handleKicked() {
+  if (app.role !== ROLE.KICKED) return false;
+  stopPoll();
+  leaveRoom({ cleanMember: false });
+  setNotice('你已被房主移出房间。');
+  return true;
 }
 
 /** Tell the table when somebody joins or leaves. */
@@ -803,14 +885,15 @@ function renderRoom() {
   );
 
   const rosterList = h('ul', { id: 'roster', class: 'roster' });
+  const rosterHint = h('p', { id: 'roster-hint', class: 'hint' });
   const takeSeatButton = h('button', { id: 'take-seat', class: 'action-button wide hidden', type: 'button' }, '接替对手');
   const membersCard = h(
     'section',
     { class: 'card' },
     h('h2', { text: '房间成员' }),
     rosterList,
+    rosterHint,
     takeSeatButton,
-    h('p', { class: 'hint', text: '成员每约 2 秒发送一次心跳；超过 15 秒没有心跳会显示为离线并暂时离开名单。' }),
   );
 
   const undoRequest = h('button', { id: 'undo-request', class: 'action-button wide', type: 'button' }, '悔棋');
@@ -902,6 +985,7 @@ function renderRoom() {
     clearRoom,
     closeRoom,
     rosterList,
+    rosterHint,
     takeSeatButton,
     invite,
   });
@@ -1048,9 +1132,9 @@ async function enterRoom(roomRow = null) {
   schedulePoll();
 }
 
-function leaveRoom() {
+function leaveRoom({ cleanMember = true } = {}) {
   stopPoll();
-  if (app.store && app.device) {
+  if (cleanMember && app.store && app.device) {
     // Best effort: free the seat (and the name) right away instead of waiting
     // for the presence timeout to expire.
     Promise.resolve(app.store.leaveRoom(app.device)).catch(() => {});
@@ -1491,7 +1575,11 @@ function syncRoomUI() {
 
   const state = app.state;
   const joined = Boolean(app.store && app.roomRow);
+  const readiness = app.readiness || { live: false, bothReady: false, readyHost: false, readyGuest: false };
+  const over = Boolean(app.outcome && app.outcome.over);
+  if (over) maybeResetReady();
   const spectator = app.role === ROLE.SPECTATOR;
+  if (handleKicked()) return;
   const otherSide = app.mySide === Cell.A ? Cell.B : Cell.A;
   els.roomTitle.textContent = `房间 ${app.room}`;
   els.roomNickname.textContent = `我的昵称：${app.nickname || '（未设置）'} · ${joined ? ROLE_LABELS[app.role] || '—' : '未进入房间'}`;
@@ -1504,19 +1592,21 @@ function syncRoomUI() {
         : `${ROLE_LABELS[app.role]} · 我执${sideName(app.mySide)} · 对手执${sideName(otherSide)}`;
 
   if (state) {
-    els.statusLine.textContent =
-      app.outcome && app.outcome.reason === 'timeout'
-        ? `${sideLabel(app.outcome.loser)} 方超时，${sideLabel(app.outcome.winner)} 方获胜`
-        : describe(state, app.mySide);
-    const chipSide = state.isGameOver ? state.winner : state.sideToMove;
-    const turnName = state.isGameOver ? '' : nicknameForSide(app.roster, app.roomRow, state.sideToMove);
-    els.turnChip.textContent = state.isGameOver
-      ? state.winner !== null
-        ? `${sideLabel(state.winner)} 方获胜`
-        : '和棋'
-      : state.sideToMove === app.mySide
-        ? '轮到你落子'
-        : `等待 ${sideLabel(state.sideToMove)} 方${turnName ? `（${turnName}）` : ''}落子`;
+    const counting = readiness.bothReady && !readiness.live;
+    // Before the game the clock is not running and nobody "moves"; after it,
+    // the result lives in the banner, so the status simply says 游戏结束.
+    els.statusLine.textContent = over ? '游戏结束' : readiness.live ? describe(state, app.mySide) : counting ? '读秒后开始' : '请准备';
+    const chipSide = over ? app.outcome.winner : readiness.live ? state.sideToMove : null;
+    const turnName = readiness.live && !over ? nicknameForSide(app.roster, app.roomRow, state.sideToMove) : '';
+    els.turnChip.textContent = over
+      ? '游戏结束'
+      : !readiness.live
+        ? counting
+          ? '读秒中…'
+          : '请准备'
+        : state.sideToMove === app.mySide
+          ? '轮到你落子'
+          : `等待 ${sideLabel(state.sideToMove)} 方${turnName ? `（${turnName}）` : ''}落子`;
     els.turnChip.className = chipSide === null ? 'turn-chip' : `turn-chip chip-${sideLabel(chipSide).toLowerCase()}`;
     els.statMoves.textContent = String(state.moveHistory.length);
     els.statSide.textContent = spectator ? '观战' : sideName(app.mySide);
@@ -1537,6 +1627,9 @@ function syncRoomUI() {
     (member) => member.role === ROLE.GUEST && member.device !== app.device,
   );
   els.takeSeatButton.classList.toggle('hidden', !(joined && spectator && !seatBusy));
+  els.rosterHint.textContent = rosterLocked(readiness, app.outcome)
+    ? '对局进行中：结束后才能更换对手或移出成员'
+    : '';
 
   const request = joined && state ? pendingUndo(app.events, app.moves.length) : null;
   const mine = request && request.side === app.mySide;
@@ -1565,21 +1658,21 @@ function syncRoomUI() {
   els.undoStatus.textContent = mine ? '悔棋请求已发出，等待对手回应…' : '';
 
   const player = app.role === ROLE.HOST || app.role === ROLE.GUEST;
-  const readiness = app.readiness || refreshReadiness();
   const myReady = app.readyGame >= (app.game || 1);
   const opponentReady = app.role === ROLE.HOST ? readiness.readyGuest : readiness.readyHost;
-  els.readyButton.classList.toggle('hidden', !joined || !player);
-  els.readyButton.disabled = !joined || !player || (readiness.live && !app.outcome.over);
+  // The ready control belongs to the time between games: once the clock is
+  // running it disappears, and a finished game clears both ready flags.
+  els.readyButton.classList.toggle('hidden', !joined || !player || (readiness.live && !over));
+  els.readyButton.disabled = !joined || !player;
   els.readyButton.textContent = myReady ? '取消准备' : '准备完毕';
   els.readyHint.textContent = !joined || !player
     ? ''
     : readiness.opponentWaiting
-      ? '还没有对手：把邀请链接发给朋友，他打开后你们再各自点“准备完毕”。'
-      : readiness.live && !app.outcome.over
-        ? '对局进行中。'
+      ? '等待对手加入'
+      : readiness.live && !over
+        ? ''
         : `你：${myReady ? '已准备' : '未准备'} · 对手：${opponentReady ? '已准备' : '未准备'}`;
 
-  const over = Boolean(app.outcome && app.outcome.over);
   els.resultBanner.classList.toggle('hidden', !over);
   if (over) {
     els.resultText.textContent =
@@ -1600,6 +1693,7 @@ function renderRoster() {
   const list = clear(els.rosterList);
   const now = app.serverTime || Date.now();
   const online = new Set(activeMembers(app.members, now).map((member) => member.device));
+  const locked = rosterLocked(app.readiness, app.outcome);
   if (!app.roster.length) {
     list.append(h('li', { class: 'history-empty', text: '暂无成员' }));
     return;
@@ -1609,6 +1703,21 @@ function renderRoster() {
     const side = member.side === null || member.side === undefined ? null : Number(member.side);
     const badges = [ROLE_LABELS[member.role] || member.role];
     if (side !== null) badges.push(`${sideLabel(side)} 方`);
+    const actions = [];
+    if (app.host && !isMe && member.role !== ROLE.HOST) {
+      if (member.role === ROLE.GUEST) {
+        actions.push(
+          h('button', { class: 'roster-action', type: 'button', disabled: locked, onclick: () => demoteOpponent(member) }, '降为旁观'),
+        );
+      } else if (member.role === ROLE.SPECTATOR) {
+        actions.push(
+          h('button', { class: 'roster-action', type: 'button', disabled: locked, onclick: () => promoteToOpponent(member) }, '选为对手'),
+        );
+      }
+      actions.push(
+        h('button', { class: 'roster-action danger', type: 'button', disabled: locked, onclick: () => kickMember(member) }, '移出'),
+      );
+    }
     list.append(
       h(
         'li',
@@ -1616,12 +1725,14 @@ function renderRoster() {
         h('span', { class: `presence-dot${online.has(member.device) ? ' is-online' : ''}` }),
         h('span', { class: 'roster-name', text: `${member.nickname}${isMe ? '（你）' : ''}` }),
         h('span', { class: 'roster-role', text: badges.join(' · ') }),
+        actions.length ? h('span', { class: 'roster-actions' }, ...actions) : null,
       ),
     );
   }
   for (const member of app.members) {
     if (member.device === app.device || online.has(member.device)) continue;
     if (app.roster.some((entry) => entry.device === member.device)) continue;
+    if (member.role === ROLE.KICKED) continue;
     list.append(
       h(
         'li',

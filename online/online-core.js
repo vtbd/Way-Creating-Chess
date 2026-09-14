@@ -40,10 +40,10 @@ export const CLOCK_LIMITS = {
 export const COUNTDOWN_MS = 3000;
 
 /** Roles inside a room. Only the host and the guest play; everyone else watches. */
-export const ROLE = { HOST: 'host', GUEST: 'guest', SPECTATOR: 'spectator' };
-export const ROLE_LABELS = { host: '房主', guest: '对手', spectator: '观战' };
+export const ROLE = { HOST: 'host', GUEST: 'guest', SPECTATOR: 'spectator', KICKED: 'kicked' };
+export const ROLE_LABELS = { host: '房主', guest: '对手', spectator: '观战', kicked: '已移出' };
 /** A device counts as online while its heartbeat is younger than this. */
-export const PRESENCE_TIMEOUT_MS = 15000;
+export const PRESENCE_TIMEOUT_MS = 5000;
 
 export function defaultBoard() {
   const boards = presetBoards();
@@ -112,6 +112,16 @@ export function sideForRoleName(room, role) {
   return null;
 }
 
+/**
+ * The opponent seat may only be changed between games: while a game is live
+ * (clock running) the host cannot swap, demote or remove the opponent.
+ */
+export function rosterLocked(readiness, outcome) {
+  const live = Boolean(readiness && readiness.live);
+  const over = Boolean(outcome && outcome.over);
+  return live && !over;
+}
+
 /* ------------------------------------------------------------- presence */
 
 /** Members whose heartbeat is fresh enough to count as online. */
@@ -134,6 +144,8 @@ export function activeMembers(members, serverTimeMs, timeoutMs = PRESENCE_TIMEOU
 export function roleFor({ room, members, device, serverTimeMs, isHostDevice }) {
   const active = activeMembers(members, serverTimeMs);
   const mine = (members || []).find((member) => member.device === device) || null;
+  // A device the host removed stays removed until somebody clears the row.
+  if (mine && mine.role === ROLE.KICKED) return ROLE.KICKED;
   if (isHostDevice) return ROLE.HOST;
   if (active.some((member) => member.role === ROLE.GUEST && member.device !== device)) return ROLE.SPECTATOR;
   // A device keeps whatever seat it already holds; only a first-time arrival

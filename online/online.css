@@ -241,6 +241,33 @@
   white-space: nowrap;
 }
 
+.roster-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.roster-action {
+  padding: 3px 8px;
+  font-size: 0.74rem;
+  border-radius: 7px;
+  background: var(--panel-raise);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.roster-action:hover:not([disabled]) {
+  background: var(--button-hover);
+}
+
+.roster-action.danger {
+  background: var(--danger);
+}
+
+.roster-action[disabled] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .undo-prompt {
 /* Keep the board a touch smaller than the solo build so the cards fit on a
    laptop screen. */
