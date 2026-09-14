@@ -262,13 +262,15 @@ test('the store speaks the documented REST dialect', async () => {
   await store.appendMove({ game: 1, moveIndex: 0, side: Cell.A, x: 0, y: 0 });
   await store.appendEvent({ game: 1, kind: EVENT.UNDO_REQUEST, side: Cell.B, target: 0 });
 
-  assert.equal(shape.calls[0].table, 'rooms');
-  assert.equal(shape.calls[0].headers.apikey, 'eyJtest');
-  assert.equal(shape.calls[0].headers.Authorization, 'Bearer eyJtest');
-  assert.equal(shape.calls[0].body[0].code, 'AB12', 'room codes are upper-cased');
-  assert.equal(shape.calls[1].params.get('order'), 'move_index.asc');
-  assert.equal(shape.calls[1].params.get('game'), 'eq.1');
-  assert.equal(shape.calls[2].headers.Prefer, 'return=minimal');
+  const find = (table, method) => shape.calls.find((call) => call.table === table && call.method === method);
+  const roomCall = find('rooms', 'POST');
+  assert.equal(roomCall.headers.apikey, 'eyJtest');
+  assert.equal(roomCall.headers.Authorization, 'Bearer eyJtest');
+  assert.equal(roomCall.body[0].code, 'AB12', 'room codes are upper-cased');
+  assert.equal(find('moves', 'GET').params.get('order'), 'move_index.asc');
+  assert.equal(find('moves', 'GET').params.get('game'), 'eq.1');
+  assert.equal(find('moves', 'POST').headers.Prefer, 'return=minimal');
+  assert.ok(find('members', 'DELETE'), 'a fresh room clears leftover members');
 
   const duplicate = await store.createRoom({ board: { width: 1, height: 1, content: [[1]] }, hostToken: 'tok', hostSide: Cell.A });
   assert.equal(duplicate.ok, false);
@@ -295,6 +297,41 @@ test('a database missing the new columns explains how to fix it', async () => {
   assert.match(result.reason, /数据库结构不是最新的/);
   assert.match(result.reason, /rooms\.main_ms/);
   assert.match(result.reason, /reload schema/);
+});
+
+test('closing a room deletes every trace of it', async () => {
+  const shape = createFakeSupabase();
+  const store = createSupabaseStore({ url: 'https://demo.supabase.co', key: 'eyJtest', room: 'WIPE1', fetchImpl: shape.fetchImpl });
+  await store.createRoom({ board: { width: 12, height: 9, content: [[1]] }, hostToken: 'tok', hostSide: Cell.A, mainMs: 600000, moveMs: 90000 });
+  await store.appendMove({ game: 1, moveIndex: 0, side: Cell.A, x: 0, y: 0 });
+  await store.appendEvent({ game: 1, kind: EVENT.UNDO_REQUEST, side: Cell.B, target: 0 });
+  await store.heartbeat({ device: 'd1', nickname: '小测', role: ROLE.HOST, side: Cell.A, readyGame: 1 });
+  await store.heartbeat({ device: 'd2', nickname: '小刚', role: ROLE.GUEST, side: Cell.B, readyGame: 1 });
+
+  assert.equal(shape.db.members.length, 2);
+  const closed = await store.closeRoom();
+  assert.equal(closed.ok, true);
+  assert.equal(shape.room('WIPE1'), null, 'the room row is gone');
+  assert.equal(shape.movesOf('WIPE1').length, 0, 'moves are gone');
+  assert.equal(shape.eventsOf('WIPE1').length, 0, 'events are gone');
+  assert.equal(shape.membersOf('WIPE1').length, 0, 'members are gone too');
+});
+
+test('re-creating the same room code starts from an empty roster', async () => {
+  const shape = createFakeSupabase();
+  const store = createSupabaseStore({ url: 'https://demo.supabase.co', key: 'eyJtest', room: 'SAME1', fetchImpl: shape.fetchImpl });
+  await store.createRoom({ board: { width: 12, height: 9, content: [[1]] }, hostToken: 'tok', hostSide: Cell.A, mainMs: 600000, moveMs: 90000 });
+  await store.heartbeat({ device: 'old-device', nickname: '旧成员', role: ROLE.GUEST, side: Cell.B, readyGame: 1 });
+  await store.closeRoom();
+  assert.equal(shape.membersOf('SAME1').length, 0);
+
+  // Even leftovers from an older build (member rows without a room row) are
+  // cleared when the code is created again.
+  shape.injectMember({ room: 'SAME1', device: 'legacy-device', nickname: '遗留成员', role: ROLE.SPECTATOR });
+  assert.equal(shape.membersOf('SAME1').length, 1);
+  const recreated = await store.createRoom({ board: { width: 12, height: 9, content: [[1]] }, hostToken: 'tok2', hostSide: Cell.A, mainMs: 600000, moveMs: 90000 });
+  assert.equal(recreated.ok, true);
+  assert.equal(shape.membersOf('SAME1').length, 0, 'the new room starts with nobody in it');
 });
 
 /* ------------------------------------------------------------------ clock */

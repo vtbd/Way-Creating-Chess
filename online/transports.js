@@ -95,7 +95,12 @@ export function createSupabaseStore({ url, key, room, fetchImpl = globalThis.fet
           { code, board, host_token: hostToken, host_side: hostSide, game: 1, main_ms: mainMs, move_ms: moveMs },
         ]),
       });
-      if (response.ok) return { ok: true };
+      if (response.ok) {
+        // The code was free, so any member rows left over from an earlier room
+        // with the same code are stale: start from an empty roster.
+        await fetchImpl(`${members}?${roomFilter}`, { method: 'DELETE', headers }).catch(() => null);
+        return { ok: true };
+      }
       if (response.status === 409) return { ok: false, reason: `房间号 ${code} 已被占用，换一个再试` };
       return failure(response, '创建房间');
     },
@@ -175,6 +180,7 @@ export function createSupabaseStore({ url, key, room, fetchImpl = globalThis.fet
       const responses = await Promise.all([
         fetchImpl(`${moves}?${roomFilter}`, { method: 'DELETE', headers }),
         fetchImpl(`${events}?${roomFilter}`, { method: 'DELETE', headers }),
+        fetchImpl(`${members}?${roomFilter}`, { method: 'DELETE', headers }),
         fetchImpl(`${rooms}?code=eq.${encodeURIComponent(code)}`, { method: 'DELETE', headers }),
       ]);
       const bad = responses.find((response) => !response.ok);
